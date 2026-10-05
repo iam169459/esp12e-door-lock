@@ -49,7 +49,13 @@ struct DeviceSettings
 };
 
 DeviceSettings settings;
-String authorizedTags[32];
+struct AuthorizedTag
+{
+    String uid;
+    String holderName;
+};
+
+AuthorizedTag authorizedTags[32];
 uint8_t authorizedTagCount = 0;
 String lastUid = "";
 String lastStatus = "idle";
@@ -130,7 +136,7 @@ void loadSettings()
         return;
     }
 
-    DynamicJsonDocument doc(512);
+    DynamicJsonDocument doc(3072);
     DeserializationError err = deserializeJson(doc, data);
     if (err)
     {
@@ -197,20 +203,49 @@ void loadAuthorizedTags()
     JsonArray array = doc.as<JsonArray>();
     for (JsonVariant value : array)
     {
-        if (authorizedTagCount < 32)
+        if (authorizedTagCount >= 32)
         {
-            authorizedTags[authorizedTagCount++] = value.as<String>();
+            break;
+        }
+
+        String uid;
+        String holderName;
+        if (value.is<JsonObject>())
+        {
+            JsonObject tag = value.as<JsonObject>();
+            uid = tag["uid"] | "";
+            holderName = tag["name"] | "";
+        }
+        else
+        {
+            uid = value.as<String>();
+        }
+
+        uid.trim();
+        uid.toUpperCase();
+        holderName.trim();
+        if (holderName.length() > 32)
+        {
+            holderName = holderName.substring(0, 32);
+        }
+        if (uid.length() > 0)
+        {
+            authorizedTags[authorizedTagCount].uid = uid;
+            authorizedTags[authorizedTagCount].holderName = holderName;
+            authorizedTagCount++;
         }
     }
 }
 
 void saveAuthorizedTags()
 {
-    DynamicJsonDocument doc(512);
+    DynamicJsonDocument doc(3072);
     JsonArray array = doc.to<JsonArray>();
     for (uint8_t i = 0; i < authorizedTagCount; ++i)
     {
-        array.add(authorizedTags[i]);
+        JsonObject tag = array.createNestedObject();
+        tag["uid"] = authorizedTags[i].uid;
+        tag["name"] = authorizedTags[i].holderName;
     }
 
     String out;
@@ -222,7 +257,7 @@ bool isAuthorized(const String &uid)
 {
     for (uint8_t i = 0; i < authorizedTagCount; ++i)
     {
-        if (authorizedTags[i].equalsIgnoreCase(uid))
+        if (authorizedTags[i].uid.equalsIgnoreCase(uid))
         {
             return true;
         }
@@ -230,18 +265,40 @@ bool isAuthorized(const String &uid)
     return false;
 }
 
-bool addAuthorizedTag(const String &uid)
+String holderNameFor(const String &uid)
 {
-    if (uid.length() == 0)
+    for (uint8_t i = 0; i < authorizedTagCount; ++i)
+    {
+        if (authorizedTags[i].uid.equalsIgnoreCase(uid))
+        {
+            return authorizedTags[i].holderName.length() > 0 ? authorizedTags[i].holderName : "Unassigned";
+        }
+    }
+    return "Unassigned";
+}
+
+bool addAuthorizedTag(const String &uid, String holderName)
+{
+    String normalizedUid = uid;
+    normalizedUid.trim();
+    normalizedUid.toUpperCase();
+    holderName.trim();
+    if (normalizedUid.length() == 0 || holderName.length() == 0)
     {
         return false;
+    }
+    if (holderName.length() > 32)
+    {
+        holderName = holderName.substring(0, 32);
     }
 
     for (uint8_t i = 0; i < authorizedTagCount; ++i)
     {
-        if (authorizedTags[i].equalsIgnoreCase(uid))
+        if (authorizedTags[i].uid.equalsIgnoreCase(normalizedUid))
         {
-            return false;
+            authorizedTags[i].holderName = holderName;
+            saveAuthorizedTags();
+            return true;
         }
     }
 
@@ -250,7 +307,9 @@ bool addAuthorizedTag(const String &uid)
         return false;
     }
 
-    authorizedTags[authorizedTagCount++] = uid;
+    authorizedTags[authorizedTagCount].uid = normalizedUid;
+    authorizedTags[authorizedTagCount].holderName = holderName;
+    authorizedTagCount++;
     saveAuthorizedTags();
     return true;
 }
@@ -259,7 +318,7 @@ bool removeAuthorizedTag(const String &uid)
 {
     for (uint8_t i = 0; i < authorizedTagCount; ++i)
     {
-        if (authorizedTags[i].equalsIgnoreCase(uid))
+        if (authorizedTags[i].uid.equalsIgnoreCase(uid))
         {
             for (uint8_t j = i; j < authorizedTagCount - 1; ++j)
             {
@@ -522,7 +581,7 @@ void handleUpdateCheck()
 
 String buildStatusJson()
 {
-    DynamicJsonDocument doc(512);
+    DynamicJsonDocument doc(3072);
     doc["status"] = lastStatus;
     doc["relayOpen"] = relayOpen;
     doc["doorOpen"] = doorOpen;
@@ -537,7 +596,9 @@ String buildStatusJson()
     JsonArray tags = doc.createNestedArray("tags");
     for (uint8_t i = 0; i < authorizedTagCount; ++i)
     {
-        tags.add(authorizedTags[i]);
+        JsonObject tag = tags.createNestedObject();
+        tag["uid"] = authorizedTags[i].uid;
+        tag["name"] = authorizedTags[i].holderName;
     }
     String output;
     serializeJson(doc, output);
@@ -643,6 +704,7 @@ void handleRoot()
         th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); }
         th { color: var(--muted); font-size: 12px; font-weight: 600; }
         td button { min-height: 34px; padding: 6px 10px; }
+        .row-actions { display: flex; flex-wrap: wrap; gap: 6px; }
         .scanResult { margin: 12px 0; color: var(--muted); }
         .update-panel { padding: 14px; margin: 14px 0; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-raised); }
         .update-panel.available { border-color: var(--amber); }
@@ -693,16 +755,18 @@ void handleRoot()
 
         <section id="cards" class="card hidden">
             <h2>Card manager</h2>
+            <form id="manualCardForm" data-feedback="manualCardFeedback" method="POST" action="/api/add-tag">
+                <label for="cardHolderName">Card holder name</label>
+                <input id="cardHolderName" name="name" maxlength="32" placeholder="For example, User 1" required />
             <div class="actions"><button id="scanCardButton" class="secondary" type="button" onclick="scanAndAddCard()">Scan and add card</button></div>
             <p id="scanStatus" class="scanResult" role="status" aria-live="polite">Waiting for scan.</p>
-            <form id="manualCardForm" data-feedback="manualCardFeedback" method="POST" action="/api/add-tag">
                 <label for="manualUid">Add a card UID manually</label>
                 <input name="uid" id="manualUid" placeholder="For example, 01A2B3C4" required />
-                <button type="submit">Add card</button>
+                <button type="submit">Add or rename card</button>
                 <p id="manualCardFeedback" class="feedback" role="status" aria-live="polite"></p>
             </form>
             <table aria-label="Authorized cards">
-                <thead><tr><th>Card UID</th><th>Action</th></tr></thead>
+                <thead><tr><th>Card holder</th><th>Card UID</th><th>Actions</th></tr></thead>
                 <tbody id="tagTable"></tbody>
             </table>
         </section>
@@ -851,23 +915,39 @@ void handleRoot()
             const table = document.getElementById('tagTable');
             const rows = document.createDocumentFragment();
             tags.forEach(tag => {
+                const uid = typeof tag === 'string' ? tag : tag.uid;
+                const holderName = typeof tag === 'string' ? '' : tag.name;
                 const row = document.createElement('tr');
+                const holderCell = document.createElement('td');
+                holderCell.textContent = holderName || 'Unassigned';
                 const uidCell = document.createElement('td');
-                uidCell.textContent = tag;
+                uidCell.textContent = uid;
                 const actionCell = document.createElement('td');
+                actionCell.className = 'row-actions';
+                const renameButton = document.createElement('button');
+                renameButton.type = 'button';
+                renameButton.className = 'secondary';
+                renameButton.textContent = 'Rename';
+                renameButton.addEventListener('click', () => {
+                    document.getElementById('cardHolderName').value = holderName;
+                    document.getElementById('manualUid').value = uid;
+                    document.getElementById('manualCardFeedback').textContent = 'Update the holder name and save.';
+                    document.getElementById('cardHolderName').focus();
+                });
                 const removeButton = document.createElement('button');
                 removeButton.type = 'button';
                 removeButton.className = 'warn';
                 removeButton.textContent = 'Remove';
-                removeButton.addEventListener('click', () => removeTag(tag));
+                removeButton.addEventListener('click', () => removeTag(uid));
+                actionCell.appendChild(renameButton);
                 actionCell.appendChild(removeButton);
-                row.append(uidCell, actionCell);
+                row.append(holderCell, uidCell, actionCell);
                 rows.appendChild(row);
             });
             if (!tags.length) {
                 const row = document.createElement('tr');
                 const cell = document.createElement('td');
-                cell.colSpan = 2;
+                cell.colSpan = 3;
                 cell.textContent = 'No authorized cards.';
                 row.appendChild(cell);
                 rows.appendChild(row);
@@ -926,6 +1006,12 @@ void handleRoot()
 
         async function scanAndAddCard() {
             if (cardScanPending) return;
+            const holderName = document.getElementById('cardHolderName').value.trim();
+            if (!holderName) {
+                document.getElementById('scanStatus').textContent = 'Enter the card holder name first.';
+                document.getElementById('cardHolderName').focus();
+                return;
+            }
             cardScanPending = true;
             const button = document.getElementById('scanCardButton');
       const statusEl = document.getElementById('scanStatus');
@@ -935,9 +1021,9 @@ void handleRoot()
                 const response = await fetch('/api/scan-tag');
                 const data = await response.json();
                 if (!response.ok || !data.ok) throw new Error(data.error || 'No card detected');
-                const added = await fetch('/api/add-tag', { method: 'POST', body: new URLSearchParams({ uid: data.uid }) });
+                const added = await fetch('/api/add-tag', { method: 'POST', body: new URLSearchParams({ uid: data.uid, name: holderName }) });
                 if (!added.ok) throw new Error('Could not add this card');
-                statusEl.textContent = 'Card added: ' + data.uid;
+                statusEl.textContent = 'Card assigned to ' + holderName + ': ' + data.uid;
                 await refreshStatus();
             } catch (error) {
                 statusEl.textContent = error.message;
@@ -1094,12 +1180,20 @@ void handleAddTag()
     String uid = server.arg("uid");
     uid.trim();
     uid.toUpperCase();
-    if (uid.length() > 0)
+    String holderName = server.arg("name");
+    holderName.trim();
+    if (holderName.length() == 0)
     {
-        addAuthorizedTag(uid);
+        holderName = "User " + String(authorizedTagCount + 1);
     }
-    server.sendHeader("Location", "/");
-    server.send(302, "text/plain", "Added tag");
+
+    if (!addAuthorizedTag(uid, holderName))
+    {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid UID or card limit reached\"}");
+        return;
+    }
+
+    server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleRemoveTag()
@@ -1219,7 +1313,7 @@ void handleRfidRead()
         lastStatus = "access granted";
         tone(BUZZER_PIN, 2000, 200);
         unlockDoor();
-        postToGoogleSheet("access", uid, "granted");
+        postToGoogleSheet("access", uid, "granted: " + holderNameFor(uid));
         Serial.printf("Access granted: %s\n", uid.c_str());
     }
     else
