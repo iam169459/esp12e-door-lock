@@ -63,6 +63,7 @@ bool updateAvailable = false;
 unsigned long lastUpdateCheckAt = 0;
 String latestFirmwareVersion = "";
 String latestReleasePage = "";
+String otaFailureReason = "";
 ESP8266WebServer server(80);
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 
@@ -323,8 +324,10 @@ bool postToGoogleSheet(const String &eventType, const String &uid, const String 
 
 bool installFirmwareFromUrl(const String &url)
 {
+    otaFailureReason = "";
     if (!url.startsWith("http"))
     {
+        otaFailureReason = "Invalid firmware URL";
         return false;
     }
 
@@ -335,41 +338,61 @@ bool installFirmwareFromUrl(const String &url)
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     if (!http.begin(client, url))
     {
+        otaFailureReason = "Could not open firmware URL";
         return false;
     }
 
     int code = http.GET();
     if (code != HTTP_CODE_OK)
     {
+        otaFailureReason = "Firmware download HTTP " + String(code) + ": " + http.errorToString(code);
         http.end();
         return false;
     }
 
     size_t length = http.getSize();
-    if (length == 0)
+    if (length == 0 || length == static_cast<size_t>(-1))
     {
+        otaFailureReason = "Firmware download has no valid content length";
         http.end();
         return false;
     }
 
     if (!Update.begin(length))
     {
+        otaFailureReason = "Updater begin failed: " + Update.getErrorString();
         http.end();
         return false;
     }
 
     WiFiClient *stream = http.getStreamPtr();
+    unsigned long streamWaitStarted = millis();
+    while (!stream->available() && stream->connected() && millis() - streamWaitStarted < 10000UL)
+    {
+        delay(10);
+        yield();
+    }
+    if (!stream->available())
+    {
+        otaFailureReason = "Firmware stream did not become readable";
+        Update.end(false);
+        http.end();
+        return false;
+    }
+
     size_t written = Update.writeStream(*stream);
     http.end();
 
     if (written != length)
     {
+        otaFailureReason = "Firmware stream incomplete: " + String(written) + "/" + String(length) + "; " + Update.getErrorString();
         Update.end(false);
         return false;
     }
 
     if (!Update.end(true))
     {
+        otaFailureReason = "Updater finalize failed: " + Update.getErrorString();
         return false;
     }
 
@@ -520,7 +543,7 @@ String escapeHtmlAttribute(const String &value)
 
 void handleRoot()
 {
-    String page = R"HTML(
+    static const char page[] PROGMEM = R"HTML(
 <!DOCTYPE html>
 <html>
 <head>
@@ -638,26 +661,26 @@ void handleRoot()
             <h2>Device settings</h2>
             <form method="POST" action="/api/settings">
                 <label for="wifiSsid">Wi-Fi network</label>
-                <input id="wifiSsid" name="wifiSsid" value="{{WIFI_SSID}}" required />
+                <input id="wifiSsid" name="wifiSsid" required />
                 <label for="wifiPassword">New Wi-Fi password</label>
                 <input id="wifiPassword" name="wifiPassword" type="password" autocomplete="new-password" placeholder="Leave blank to keep current password" />
                 <label for="unlockMs">Unlock duration (milliseconds)</label>
-                <input id="unlockMs" name="unlockMs" type="number" min="500" max="30000" value="{{UNLOCK_MS}}" required />
+                <input id="unlockMs" name="unlockMs" type="number" min="500" max="30000" value="3000" required />
                 <button type="submit">Save device settings</button>
             </form>
 
             <h3>Google Sheets logging</h3>
             <form method="POST" action="/api/settings">
                 <label for="googleSheetUrl">Apps Script URL</label>
-                <input id="googleSheetUrl" name="googleSheetUrl" type="url" value="{{SHEET_URL}}" placeholder="https://script.google.com/.../exec" />
-                <div class="check-row"><input id="googleLoggingEnabled" name="googleLoggingEnabled" type="checkbox" {{LOGGING_CHECKED}} /><label for="googleLoggingEnabled">Enable access logging</label></div>
+                <input id="googleSheetUrl" name="googleSheetUrl" type="url" placeholder="https://script.google.com/.../exec" />
+                <div class="check-row"><input id="googleLoggingEnabled" name="googleLoggingEnabled" type="checkbox" /><label for="googleLoggingEnabled">Enable access logging</label></div>
                 <button type="submit">Save logging settings</button>
             </form>
         </section>
 
         <section id="ota" class="card hidden">
             <h2>Firmware updates</h2>
-            <p class="muted">Installed version: <span id="currentVersion">{{CURRENT_VERSION}}</span></p>
+            <p class="muted">Installed version: <span id="currentVersion">--</span></p>
             <div id="updatePanel" class="update-panel">
                 <p id="updateMessage" role="status" aria-live="polite">Checking for updates...</p>
                 <div class="actions">
@@ -667,7 +690,7 @@ void handleRoot()
                 <p><a id="releaseLink" class="hidden" href="#" target="_blank" rel="noopener noreferrer">View release notes</a></p>
             </div>
             <label for="firmwareSource">Fixed firmware source</label>
-            <input id="firmwareSource" type="url" value="{{OTA_URL}}" readonly />
+            <input id="firmwareSource" type="url" value="https://github.com/iam169459/esp12e-door-lock/releases/latest/download/firmware.bin" readonly />
         </section>
   </div>
 
@@ -705,6 +728,20 @@ void handleRoot()
             } catch (error) {
                 document.getElementById('connectionState').textContent = 'Device unavailable';
                 document.getElementById('connectionState').classList.remove('online');
+            }
+        }
+
+        async function loadSettings() {
+            try {
+                const response = await fetch('/api/settings', { cache: 'no-store' });
+                if (!response.ok) throw new Error('Settings unavailable');
+                const data = await response.json();
+                document.getElementById('wifiSsid').value = data.wifiSSID || '';
+                document.getElementById('unlockMs').value = data.unlockMs || 3000;
+                document.getElementById('googleSheetUrl').value = data.googleSheetUrl || '';
+                document.getElementById('googleLoggingEnabled').checked = Boolean(data.googleLoggingEnabled);
+            } catch (error) {
+                document.getElementById('unlockFeedback').textContent = 'Could not load saved settings.';
             }
         }
 
@@ -879,6 +916,7 @@ void handleRoot()
             if (confirm('Restart the door lock now?')) await fetch('/api/restart', { method: 'POST' });
     }
     refreshStatus();
+    loadSettings();
         checkForUpdates();
         setInterval(refreshStatus, 1000);
         setInterval(checkForUpdates, 15 * 60 * 1000);
@@ -886,13 +924,7 @@ void handleRoot()
 </body>
 </html>
 )HTML";
-    page.replace("{{OTA_URL}}", escapeHtmlAttribute(String(REPO_OTA_URL)));
-    page.replace("{{WIFI_SSID}}", escapeHtmlAttribute(settings.wifiSSID));
-    page.replace("{{UNLOCK_MS}}", String(settings.unlockMs));
-    page.replace("{{CURRENT_VERSION}}", FIRMWARE_VERSION);
-    page.replace("{{SHEET_URL}}", escapeHtmlAttribute(settings.googleSheetUrl));
-    page.replace("{{LOGGING_CHECKED}}", settings.googleLoggingEnabled ? "checked" : "");
-    server.send(200, "text/html", page);
+    server.send_P(200, "text/html", page);
 }
 
 void handleStatus()
@@ -932,6 +964,18 @@ void handleSettings()
     saveSettings();
     server.sendHeader("Location", "/");
     server.send(302, "text/plain", "Saved");
+}
+
+void handleSettingsRead()
+{
+    DynamicJsonDocument doc(384);
+    doc["wifiSSID"] = settings.wifiSSID;
+    doc["googleSheetUrl"] = settings.googleSheetUrl;
+    doc["googleLoggingEnabled"] = settings.googleLoggingEnabled;
+    doc["unlockMs"] = settings.unlockMs;
+    String output;
+    serializeJson(doc, output);
+    server.send(200, "application/json", output);
 }
 
 void handleAddTag()
@@ -998,7 +1042,8 @@ void handleOta()
         return;
     }
 
-    server.send(500, "text/plain", "OTA failed");
+    Serial.println("OTA failed: " + otaFailureReason);
+    server.send(500, "text/plain", "OTA failed: " + otaFailureReason);
 }
 
 void connectToWifi()
@@ -1107,6 +1152,7 @@ void setup()
     server.on("/", HTTP_GET, handleRoot);
     server.on("/api/status", HTTP_GET, handleStatus);
     server.on("/api/update-check", HTTP_GET, handleUpdateCheck);
+    server.on("/api/settings", HTTP_GET, handleSettingsRead);
     server.on("/api/wifi-scan", HTTP_GET, []() {
         server.send(200, "application/json", buildWifiScanJson());
     });
