@@ -1,5 +1,5 @@
 const SHEET_NAME = "Sheet1";
-const SPREADSHEET_ID = "PASTE_SPREADSHEET_ID_HERE";
+const SPREADSHEET_ID = "1oAe-ZP0o1G-KeRddtHpecM3z7uX80m3I1FOQ0GoRxdc";
 
 function doPost(e) {
   try {
@@ -10,7 +10,13 @@ function doPost(e) {
     }
 
     if (sheet.getLastRow() === 0) {
-      sheet.appendRow(["Timestamp", "Event", "UID", "Note", "Device time (ms)"]);
+      sheet.appendRow(["Timestamp", "Event", "UID", "Card holder", "Note", "Device time (ms)"]);
+    } else {
+      const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+      if (!headers.includes("Card holder")) {
+        sheet.insertColumnAfter(3);
+        sheet.getRange(1, 4).setValue("Card holder");
+      }
     }
 
     const payload = JSON.parse(e && e.postData && e.postData.contents ? e.postData.contents : "{}");
@@ -18,6 +24,7 @@ function doPost(e) {
       new Date(),
       String(payload.event || ""),
       String(payload.uid || ""),
+      String(payload.holder || ""),
       String(payload.note || ""),
       String(payload.time || "")
     ]);
