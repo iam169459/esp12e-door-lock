@@ -361,7 +361,7 @@ void updateRelay()
     }
 }
 
-bool postToGoogleSheet(const String &eventType, const String &uid, const String &note, bool testRequest = false)
+bool postToGoogleSheet(const String &eventType, const String &uid, const String &note, bool testRequest = false, const String &holderName = "")
 {
     lastSheetsHttpCode = 0;
     lastSheetsError = "";
@@ -383,7 +383,14 @@ bool postToGoogleSheet(const String &eventType, const String &uid, const String 
 
     http.addHeader("Content-Type", "application/json");
 
-    String payload = "{\"event\":\"" + eventType + "\",\"uid\":\"" + uid + "\",\"note\":\"" + note + "\",\"time\":\"" + String(millis()) + "\"}";
+    DynamicJsonDocument payloadDoc(384);
+    payloadDoc["event"] = eventType;
+    payloadDoc["uid"] = uid;
+    payloadDoc["holder"] = holderName;
+    payloadDoc["note"] = note;
+    payloadDoc["time"] = String(millis());
+    String payload;
+    serializeJson(payloadDoc, payload);
 
     int httpCode = http.POST(payload);
     lastSheetsHttpCode = httpCode;
@@ -1313,7 +1320,7 @@ void handleRfidRead()
         lastStatus = "access granted";
         tone(BUZZER_PIN, 2000, 200);
         unlockDoor();
-        postToGoogleSheet("access", uid, "granted: " + holderNameFor(uid));
+        postToGoogleSheet("access", uid, "granted", false, holderNameFor(uid));
         Serial.printf("Access granted: %s\n", uid.c_str());
     }
     else
