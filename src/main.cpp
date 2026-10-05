@@ -877,7 +877,7 @@ void handleRoot()
                 const response = await fetch('/api/sheets-test', { method: 'POST' });
                 const data = await response.json();
                 if (!response.ok || !data.ok) throw new Error(data.message || 'Connection test failed.');
-                status.textContent = 'Test event delivered (HTTP ' + data.httpCode + '). Check the spreadsheet for the test row.';
+                status.textContent = data.message + ' (HTTP ' + data.httpCode + ').';
             } catch (error) {
                 status.textContent = error.message || 'Could not test the Sheets connection.';
             }
@@ -1286,8 +1286,8 @@ void handleSheetsTest()
     DynamicJsonDocument response(192);
     response["ok"] = succeeded;
     response["httpCode"] = lastSheetsHttpCode;
-    response["message"] = succeeded ? "Apps Script accepted the test event" : lastSheetsError;
+    response["message"] = succeeded ? "Apps Script redirected the response; verify the test row exists" : lastSheetsError;
     String output;
     serializeJson(response, output);
-    server.send(succeeded ? 200 : 502, "application/json", output);
+    server.send(succeeded ? (lastSheetsHttpCode >= 300 ? 202 : 200) : 502, "application/json", output);
 }
