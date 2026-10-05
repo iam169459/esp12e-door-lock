@@ -64,8 +64,11 @@ unsigned long lastUpdateCheckAt = 0;
 String latestFirmwareVersion = "";
 String latestReleasePage = "";
 String otaFailureReason = "";
+int lastSheetsHttpCode = 0;
+String lastSheetsError = "";
 ESP8266WebServer server(80);
 MFRC522 mfrc522(SS_PIN, RST_PIN);
+void handleSheetsTest();
 
 String readFile(const String &path)
 {
@@ -298,18 +301,23 @@ void updateRelay()
     }
 }
 
-bool postToGoogleSheet(const String &eventType, const String &uid, const String &note)
+bool postToGoogleSheet(const String &eventType, const String &uid, const String &note, bool testRequest = false)
 {
-    if (!settings.googleLoggingEnabled || settings.googleSheetUrl.length() < 10)
+    lastSheetsHttpCode = 0;
+    lastSheetsError = "";
+    if ((!settings.googleLoggingEnabled && !testRequest) || settings.googleSheetUrl.length() < 10)
     {
+        lastSheetsError = "Logging is disabled or the Apps Script URL is missing";
         return false;
     }
 
     WiFiClientSecure client;
     client.setInsecure();
     HTTPClient http;
+    http.setTimeout(20000);
     if (!http.begin(client, settings.googleSheetUrl))
     {
+        lastSheetsError = "Could not open the Apps Script URL";
         return false;
     }
 
@@ -318,8 +326,48 @@ bool postToGoogleSheet(const String &eventType, const String &uid, const String 
     String payload = "{\"event\":\"" + eventType + "\",\"uid\":\"" + uid + "\",\"note\":\"" + note + "\",\"time\":\"" + String(millis()) + "\"}";
 
     int httpCode = http.POST(payload);
+    lastSheetsHttpCode = httpCode;
+    if (httpCode >= 200 && httpCode < 300)
+    {
+        http.end();
+        return true;
+    }
+
+    String redirectLocation = http.getLocation();
+    if (httpCode >= 300 && httpCode < 400 && redirectLocation.length() > 0)
+    {
+        if (redirectLocation.startsWith("https://script.googleusercontent.com/"))
+        {
+            http.end();
+            return true;
+        }
+
+        http.end();
+        WiFiClientSecure redirectClient;
+        redirectClient.setInsecure();
+        HTTPClient redirect;
+        redirect.setTimeout(20000);
+        redirect.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        if (!redirect.begin(redirectClient, redirectLocation))
+        {
+            lastSheetsError = "Could not open the Apps Script response URL";
+            return false;
+        }
+
+        int redirectCode = redirect.GET();
+        lastSheetsHttpCode = redirectCode;
+        bool succeeded = redirectCode >= 200 && redirectCode < 300;
+        if (!succeeded)
+        {
+            lastSheetsError = "Apps Script response HTTP " + String(redirectCode) + ": " + redirect.errorToString(redirectCode);
+        }
+        redirect.end();
+        return succeeded;
+    }
+
+    lastSheetsError = "Apps Script HTTP " + String(httpCode) + ": " + http.errorToString(httpCode);
     http.end();
-    return httpCode >= 200 && httpCode < 300;
+    return false;
 }
 
 bool installFirmwareFromUrl(const String &url)
@@ -675,6 +723,8 @@ void handleRoot()
                 <input id="googleSheetUrl" name="googleSheetUrl" type="url" placeholder="https://script.google.com/.../exec" />
                 <div class="check-row"><input id="googleLoggingEnabled" name="googleLoggingEnabled" type="checkbox" /><label for="googleLoggingEnabled">Enable access logging</label></div>
                 <button type="submit">Save logging settings</button>
+                <div class="actions"><button class="secondary" type="button" onclick="testSheetsConnection()">Test connection</button></div>
+                <p id="sheetsTestStatus" class="feedback" role="status" aria-live="polite"></p>
             </form>
         </section>
 
@@ -820,7 +870,20 @@ void handleRoot()
             }
     }
 
-    async function scanAndAddCard() {
+        async function testSheetsConnection() {
+            const status = document.getElementById('sheetsTestStatus');
+            status.textContent = 'Sending a test event...';
+            try {
+                const response = await fetch('/api/sheets-test', { method: 'POST' });
+                const data = await response.json();
+                if (!response.ok || !data.ok) throw new Error(data.message || 'Connection test failed.');
+                status.textContent = 'Test event delivered (HTTP ' + data.httpCode + '). Check the spreadsheet for the test row.';
+            } catch (error) {
+                status.textContent = error.message || 'Could not test the Sheets connection.';
+            }
+        }
+
+        async function scanAndAddCard() {
             if (cardScanPending) return;
             cardScanPending = true;
             const button = document.getElementById('scanCardButton');
@@ -1185,6 +1248,7 @@ void setup()
     server.on("/api/unlock", HTTP_POST, handleUnlock);
     server.on("/api/restart", HTTP_POST, handleRestart);
     server.on("/api/ota", HTTP_POST, handleOta);
+    server.on("/api/sheets-test", HTTP_POST, handleSheetsTest);
     server.begin();
 
     Serial.println("Door lock ready");
@@ -1214,4 +1278,16 @@ void loop()
     }
 
     delay(50);
+}
+
+void handleSheetsTest()
+{
+    bool succeeded = postToGoogleSheet("test", "TEST", "Manual connection test", true);
+    DynamicJsonDocument response(192);
+    response["ok"] = succeeded;
+    response["httpCode"] = lastSheetsHttpCode;
+    response["message"] = succeeded ? "Apps Script accepted the test event" : lastSheetsError;
+    String output;
+    serializeJson(response, output);
+    server.send(succeeded ? 200 : 502, "application/json", output);
 }
