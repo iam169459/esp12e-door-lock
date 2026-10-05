@@ -23,10 +23,9 @@ constexpr uint8_t DOOR_SENSOR_PIN = D0;   // optional door switch
 constexpr uint8_t BUZZER_PIN = D4;        // optional buzzer
 constexpr uint8_t LED_PIN = D3;           // optional status LED
 
-const char *DEFAULT_WIFI_SSID = "purple";
-const char *DEFAULT_WIFI_PASSWORD = "refat123";
+const char *DEFAULT_WIFI_SSID = "";
+const char *DEFAULT_WIFI_PASSWORD = "";
 const char *AP_SSID = "DoorLock-Setup";
-const char *AP_PASSWORD = "12345678";
 const char *SETTINGS_FILE = "/settings.json";
 const char *TAGS_FILE = "/tags.json";
 #ifndef APP_VERSION
@@ -45,6 +44,8 @@ struct DeviceSettings
     String wifiSSID = DEFAULT_WIFI_SSID;
     String wifiPassword = DEFAULT_WIFI_PASSWORD;
     String googleSheetUrl = "";
+    String adminPassword = "";
+    String apPassword = "";
     bool googleLoggingEnabled = false;
     uint16_t unlockMs = 3000;
 };
@@ -157,6 +158,14 @@ void loadSettings()
     {
         settings.googleSheetUrl = doc["googleSheetUrl"].as<String>();
     }
+    if (doc.containsKey("adminPassword"))
+    {
+        settings.adminPassword = doc["adminPassword"].as<String>();
+    }
+    if (doc.containsKey("apPassword"))
+    {
+        settings.apPassword = doc["apPassword"].as<String>();
+    }
     if (doc.containsKey("googleLoggingEnabled"))
     {
         settings.googleLoggingEnabled = doc["googleLoggingEnabled"].as<bool>();
@@ -173,12 +182,46 @@ void saveSettings()
     doc["wifiSSID"] = settings.wifiSSID;
     doc["wifiPassword"] = settings.wifiPassword;
     doc["googleSheetUrl"] = settings.googleSheetUrl;
+    doc["adminPassword"] = settings.adminPassword;
+    doc["apPassword"] = settings.apPassword;
     doc["googleLoggingEnabled"] = settings.googleLoggingEnabled;
     doc["unlockMs"] = settings.unlockMs;
 
     String out;
     serializeJson(doc, out);
     writeFile(SETTINGS_FILE, out);
+}
+
+String generateDevicePassword(size_t length)
+{
+    const char alphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    String password;
+    password.reserve(length);
+    for (size_t i = 0; i < length; ++i)
+    {
+        password += alphabet[ESP.random() % (sizeof(alphabet) - 1)];
+    }
+    return password;
+}
+
+bool ensureDevicePasswords()
+{
+    bool generated = false;
+    if (settings.adminPassword.length() < 16)
+    {
+        settings.adminPassword = generateDevicePassword(24);
+        generated = true;
+    }
+    if (settings.apPassword.length() < 12)
+    {
+        settings.apPassword = generateDevicePassword(16);
+        generated = true;
+    }
+    if (generated)
+    {
+        saveSettings();
+    }
+    return generated;
 }
 
 void appendLoadedTag(String uid, String holderName)
@@ -819,6 +862,7 @@ void handleRoot()
 
         <section id="settings" class="card hidden">
             <h2>Device settings</h2>
+            <p class="muted">Admin access uses Digest sign-in. The first-boot password is printed over serial. HTTP is not encrypted; use this page only on a trusted LAN or VPN.</p>
             <form id="deviceSettingsForm" data-feedback="deviceSettingsFeedback" method="POST" action="/api/settings">
                 <label for="wifiSsid">Wi-Fi network</label>
                 <input id="wifiSsid" name="wifiSsid" required />
@@ -826,6 +870,8 @@ void handleRoot()
                 <input id="wifiPassword" name="wifiPassword" type="password" autocomplete="new-password" placeholder="Leave blank to keep current password" />
                 <label for="unlockMs">Unlock duration (milliseconds)</label>
                 <input id="unlockMs" name="unlockMs" type="number" min="500" max="30000" value="3000" required />
+                <label for="adminPassword">Change admin password</label>
+                <input id="adminPassword" name="adminPassword" type="password" minlength="16" maxlength="64" autocomplete="new-password" placeholder="Leave blank to keep current password" />
                 <button type="submit">Save device settings</button>
                 <p id="deviceSettingsFeedback" class="feedback" role="status" aria-live="polite"></p>
             </form>
@@ -934,6 +980,12 @@ void handleRoot()
             try {
                 const response = await fetch(form.action, { method: form.method, body: values });
                 if (!response.ok) throw new Error('Could not save changes.');
+                const result = await response.json();
+                if (result.authChanged) {
+                    feedback.textContent = 'Admin password changed. Reloading for sign-in...';
+                    setTimeout(() => window.location.reload(), 800);
+                    return;
+                }
                 if (form.id === 'manualCardForm') {
                     feedback.textContent = 'Card added.';
                     form.reset();
@@ -1254,6 +1306,20 @@ void handleCardsPage()
 
 void handleSettings()
 {
+    bool adminPasswordChanged = false;
+    if (server.hasArg("adminPassword") && server.arg("adminPassword").length() > 0)
+    {
+        String newAdminPassword = server.arg("adminPassword");
+        newAdminPassword.trim();
+        if (newAdminPassword.length() < 16 || newAdminPassword.length() > 64)
+        {
+            server.send(400, "application/json", "{\"ok\":false,\"error\":\"Admin password must be 16 to 64 characters\"}");
+            return;
+        }
+        settings.adminPassword = newAdminPassword;
+        adminPasswordChanged = true;
+    }
+
     if (server.hasArg("wifiSsid"))
     {
         settings.wifiSSID = server.arg("wifiSsid");
@@ -1281,8 +1347,7 @@ void handleSettings()
         settings.unlockMs = requestedUnlockMs;
     }
     saveSettings();
-    server.sendHeader("Location", "/");
-    server.send(302, "text/plain", "Saved");
+    server.send(200, "application/json", adminPasswordChanged ? "{\"ok\":true,\"authChanged\":true}" : "{\"ok\":true}");
 }
 
 void handleSettingsRead()
@@ -1373,6 +1438,18 @@ void handleOta()
     server.send(500, "text/plain", "OTA failed: " + otaFailureReason);
 }
 
+void registerProtectedRoute(const char *uri, HTTPMethod method, ESP8266WebServer::THandlerFunction handler)
+{
+    server.on(uri, method, [handler]() {
+        if (!server.authenticate("admin", settings.adminPassword.c_str()))
+        {
+            server.requestAuthentication(DIGEST_AUTH, "ESP12E Door Lock");
+            return;
+        }
+        handler();
+    });
+}
+
 void connectToWifi()
 {
     WiFi.mode(WIFI_STA);
@@ -1388,7 +1465,7 @@ void connectToWifi()
     }
 
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
+    WiFi.softAP(AP_SSID, settings.apPassword.c_str());
 }
 
 void setupWifi()
@@ -1473,18 +1550,24 @@ void setup()
     }
 
     loadSettings();
+    ensureDevicePasswords();
+    Serial.println("Device security credentials (keep this serial log private):");
+    Serial.println("Username: admin");
+    Serial.println("Admin password: " + settings.adminPassword);
+    Serial.println("Setup AP SSID: " + String(AP_SSID));
+    Serial.println("Setup AP password: " + settings.apPassword);
     loadAuthorizedTags();
     setupWifi();
 
-    server.on("/", HTTP_GET, handleRoot);
-    server.on("/api/status", HTTP_GET, handleStatus);
-    server.on("/api/cards", HTTP_GET, handleCardsPage);
-    server.on("/api/update-check", HTTP_GET, handleUpdateCheck);
-    server.on("/api/settings", HTTP_GET, handleSettingsRead);
-    server.on("/api/wifi-scan", HTTP_GET, []() {
+    registerProtectedRoute("/", HTTP_GET, handleRoot);
+    registerProtectedRoute("/api/status", HTTP_GET, handleStatus);
+    registerProtectedRoute("/api/cards", HTTP_GET, handleCardsPage);
+    registerProtectedRoute("/api/update-check", HTTP_GET, handleUpdateCheck);
+    registerProtectedRoute("/api/settings", HTTP_GET, handleSettingsRead);
+    registerProtectedRoute("/api/wifi-scan", HTTP_GET, []() {
         server.send(200, "application/json", buildWifiScanJson());
     });
-    server.on("/api/scan-tag", HTTP_GET, []() {
+    registerProtectedRoute("/api/scan-tag", HTTP_GET, []() {
         String uid;
         if (!readCardUidIfPresent(uid))
         {
@@ -1507,13 +1590,13 @@ void setup()
 
         server.send(200, "application/json", "{\"ok\":true,\"uid\":\"" + uid + "\"}");
     });
-    server.on("/api/settings", HTTP_POST, handleSettings);
-    server.on("/api/add-tag", HTTP_POST, handleAddTag);
-    server.on("/api/remove-tag", HTTP_POST, handleRemoveTag);
-    server.on("/api/unlock", HTTP_POST, handleUnlock);
-    server.on("/api/restart", HTTP_POST, handleRestart);
-    server.on("/api/ota", HTTP_POST, handleOta);
-    server.on("/api/sheets-test", HTTP_POST, handleSheetsTest);
+    registerProtectedRoute("/api/settings", HTTP_POST, handleSettings);
+    registerProtectedRoute("/api/add-tag", HTTP_POST, handleAddTag);
+    registerProtectedRoute("/api/remove-tag", HTTP_POST, handleRemoveTag);
+    registerProtectedRoute("/api/unlock", HTTP_POST, handleUnlock);
+    registerProtectedRoute("/api/restart", HTTP_POST, handleRestart);
+    registerProtectedRoute("/api/ota", HTTP_POST, handleOta);
+    registerProtectedRoute("/api/sheets-test", HTTP_POST, handleSheetsTest);
     server.begin();
 
     Serial.println("Door lock ready");

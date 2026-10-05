@@ -7,17 +7,21 @@ A PlatformIO project for an ESP-12E door lock controller with an MFRC522 RFID re
 - MFRC522 RFID access control
 - Relay-driven door lock output
 - Web UI for status, Wi‑Fi scan, card manager, settings, and OTA updates
-- Wi‑Fi station connection using the default network `purple` / `refat123`
-- Access point fallback for setup: `DoorLock-Setup` / `12345678`
+- Wi-Fi station connection configured in device settings
+- Per-device random setup access point password
+- Per-device random admin password with Digest authentication
 - Google Sheets activity logging support
 - OTA firmware update from GitHub Releases
 
-## Default Wi‑Fi
+## Security
 
-- SSID: `purple`
-- Password: `refat123`
+- First boot generates a unique admin password and setup AP password. Both are printed to the serial console; record them securely.
+- The username is `admin`. The web UI and all API routes require HTTP Digest authentication.
+- Change the admin password in Settings; use at least 16 characters.
+- The embedded server uses HTTP, not HTTPS. Digest authentication avoids sending the password directly, but page content and commands are not encrypted. Keep the lock on a trusted LAN or VPN, and do not forward its web port to the internet.
+- RC522 UID-only cards can be cloned. For high-assurance access, use a cryptographic card and compatible reader.
 
-If the configured Wi‑Fi is unavailable, the device starts an access point named `DoorLock-Setup` with password `12345678`.
+If configured Wi-Fi is unavailable, the device starts `DoorLock-Setup` using its unique generated AP password.
 
 ## Hardware wiring
 
