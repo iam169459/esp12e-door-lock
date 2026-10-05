@@ -30,6 +30,7 @@ const char *AP_PASSWORD = "12345678";
 const char *SETTINGS_FILE = "/settings.json";
 const char *TAGS_FILE = "/tags.json";
 const char *FIRMWARE_VERSION = "1.0.0";
+const char *REPO_OTA_URL = "https://github.com/iam169459/esp12e-door-lock/releases/latest/download/firmware.bin";
 
 struct DeviceSettings
 {
@@ -37,7 +38,7 @@ struct DeviceSettings
     String wifiPassword = DEFAULT_WIFI_PASSWORD;
     String googleSheetUrl = "";
     bool googleLoggingEnabled = false;
-    String githubFirmwareUrl = "https://github.com/your-user/your-repo/releases/latest/download/firmware.bin";
+    String githubFirmwareUrl = REPO_OTA_URL;
     uint16_t unlockMs = 3000;
 };
 
@@ -106,7 +107,7 @@ void loadSettings()
         settings.wifiPassword = DEFAULT_WIFI_PASSWORD;
         settings.googleSheetUrl = "";
         settings.googleLoggingEnabled = false;
-        settings.githubFirmwareUrl = "https://github.com/your-user/your-repo/releases/latest/download/firmware.bin";
+        settings.githubFirmwareUrl = REPO_OTA_URL;
         settings.unlockMs = 3000;
         return;
     }
