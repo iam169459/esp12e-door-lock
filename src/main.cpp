@@ -38,6 +38,7 @@ const char *GITHUB_RELEASE_API = "https://api.github.com/repos/iam169459/esp12e-
 constexpr unsigned long RFID_REPEAT_GUARD_MS = 750;
 constexpr unsigned long RFID_SCAN_POLL_MS = 10;
 constexpr unsigned long RELEASE_CHECK_INTERVAL_MS = 15UL * 60UL * 1000UL;
+constexpr uint16_t MAX_AUTHORIZED_TAGS = 500;
 
 struct DeviceSettings
 {
@@ -55,7 +56,7 @@ struct AuthorizedTag
     String holderName;
 };
 
-AuthorizedTag authorizedTags[32];
+AuthorizedTag authorizedTags[MAX_AUTHORIZED_TAGS];
 uint8_t authorizedTagCount = 0;
 String lastUid = "";
 String lastStatus = "idle";
@@ -76,6 +77,7 @@ String lastSheetsError = "";
 ESP8266WebServer server(80);
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 void handleSheetsTest();
+void saveAuthorizedTags();
 
 String readFile(const String &path)
 {
@@ -179,78 +181,117 @@ void saveSettings()
     writeFile(SETTINGS_FILE, out);
 }
 
+void appendLoadedTag(String uid, String holderName)
+{
+    uid.trim();
+    uid.toUpperCase();
+    holderName.trim();
+    if (uid.length() == 0 || authorizedTagCount >= MAX_AUTHORIZED_TAGS)
+    {
+        return;
+    }
+
+    for (uint16_t i = 0; i < authorizedTagCount; ++i)
+    {
+        if (authorizedTags[i].uid.equalsIgnoreCase(uid))
+        {
+            authorizedTags[i].holderName = holderName;
+            return;
+        }
+    }
+
+    authorizedTags[authorizedTagCount].uid = uid;
+    authorizedTags[authorizedTagCount].holderName = holderName;
+    authorizedTagCount++;
+}
+
 void loadAuthorizedTags()
 {
-    String data = readFile(TAGS_FILE);
     authorizedTagCount = 0;
-    if (data.length() == 0)
+    File file = SPIFFS.open(TAGS_FILE, "r");
+    if (!file)
     {
         return;
     }
 
-    DynamicJsonDocument doc(512);
-    DeserializationError err = deserializeJson(doc, data);
-    if (err)
+    if (file.peek() == '[')
     {
+        DynamicJsonDocument legacy(4096);
+        DeserializationError error = deserializeJson(legacy, file);
+        file.close();
+        if (error || !legacy.is<JsonArray>())
+        {
+            return;
+        }
+
+        for (JsonVariant value : legacy.as<JsonArray>())
+        {
+            if (value.is<JsonObject>())
+            {
+                JsonObject tag = value.as<JsonObject>();
+                appendLoadedTag(tag["uid"] | "", tag["name"] | "");
+            }
+            else
+            {
+                appendLoadedTag(value.as<String>(), "");
+            }
+        }
+        saveAuthorizedTags();
         return;
     }
 
-    if (!doc.is<JsonArray>())
+    DynamicJsonDocument record(160);
+    char line[128];
+    while (file.available() && authorizedTagCount < MAX_AUTHORIZED_TAGS)
     {
-        return;
+        size_t length = 0;
+        while (file.available())
+        {
+            char character = file.read();
+            if (character == '\n')
+            {
+                break;
+            }
+            if (length < sizeof(line) - 1)
+            {
+                line[length++] = character;
+            }
+        }
+        line[length] = '\0';
+        if (length == 0 || line[0] == '\r')
+        {
+            continue;
+        }
+
+        record.clear();
+        if (deserializeJson(record, line))
+        {
+            continue;
+        }
+        appendLoadedTag(record["uid"] | "", record["name"] | "");
     }
-
-    JsonArray array = doc.as<JsonArray>();
-    for (JsonVariant value : array)
-    {
-        if (authorizedTagCount >= 32)
-        {
-            break;
-        }
-
-        String uid;
-        String holderName;
-        if (value.is<JsonObject>())
-        {
-            JsonObject tag = value.as<JsonObject>();
-            uid = tag["uid"] | "";
-            holderName = tag["name"] | "";
-        }
-        else
-        {
-            uid = value.as<String>();
-        }
-
-        uid.trim();
-        uid.toUpperCase();
-        holderName.trim();
-        if (holderName.length() > 32)
-        {
-            holderName = holderName.substring(0, 32);
-        }
-        if (uid.length() > 0)
-        {
-            authorizedTags[authorizedTagCount].uid = uid;
-            authorizedTags[authorizedTagCount].holderName = holderName;
-            authorizedTagCount++;
-        }
-    }
+    file.close();
 }
 
 void saveAuthorizedTags()
 {
-    DynamicJsonDocument doc(3072);
-    JsonArray array = doc.to<JsonArray>();
-    for (uint8_t i = 0; i < authorizedTagCount; ++i)
+    File file = SPIFFS.open(TAGS_FILE, "w");
+    if (!file)
     {
-        JsonObject tag = array.createNestedObject();
-        tag["uid"] = authorizedTags[i].uid;
-        tag["name"] = authorizedTags[i].holderName;
+        return;
     }
 
-    String out;
-    serializeJson(doc, out);
-    writeFile(TAGS_FILE, out);
+    DynamicJsonDocument record(160);
+    for (uint16_t i = 0; i < authorizedTagCount; ++i)
+    {
+        record.clear();
+        JsonObject tag = record.to<JsonObject>();
+        tag["uid"] = authorizedTags[i].uid;
+        tag["name"] = authorizedTags[i].holderName;
+        serializeJson(record, file);
+        file.println();
+    }
+    file.close();
 }
 
 bool isAuthorized(const String &uid)
@@ -302,7 +343,7 @@ bool addAuthorizedTag(const String &uid, String holderName)
         }
     }
 
-    if (authorizedTagCount >= 32)
+    if (authorizedTagCount >= MAX_AUTHORIZED_TAGS)
     {
         return false;
     }
@@ -600,13 +641,6 @@ String buildStatusJson()
     doc["unlockCooldownMs"] = hasUnlockedSinceBoot && elapsedSinceUnlock < unlockCooldownMs ? unlockCooldownMs - elapsedSinceUnlock : 0;
     doc["tagCount"] = authorizedTagCount;
     doc["lastUid"] = lastUid;
-    JsonArray tags = doc.createNestedArray("tags");
-    for (uint8_t i = 0; i < authorizedTagCount; ++i)
-    {
-        JsonObject tag = tags.createNestedObject();
-        tag["uid"] = authorizedTags[i].uid;
-        tag["name"] = authorizedTags[i].holderName;
-    }
     String output;
     serializeJson(doc, output);
     return output;
@@ -776,6 +810,11 @@ void handleRoot()
                 <thead><tr><th>Card holder</th><th>Card UID</th><th>Actions</th></tr></thead>
                 <tbody id="tagTable"></tbody>
             </table>
+            <div class="actions">
+                <button id="previousCardsButton" class="secondary" type="button" onclick="changeCardsPage(-1)" disabled>Previous</button>
+                <span id="cardsPageInfo" class="feedback" aria-live="polite">Loading cards...</span>
+                <button id="nextCardsButton" class="secondary" type="button" onclick="changeCardsPage(1)" disabled>Next</button>
+            </div>
         </section>
 
         <section id="settings" class="card hidden">
@@ -824,6 +863,10 @@ void handleRoot()
         let cardScanPending = false;
         let updateCheckPending = false;
         let statusRefreshPending = false;
+        let cardsRequestPending = false;
+        let cardsOffset = 0;
+        let cardsTotal = 0;
+        const cardsPageSize = 25;
         let updateAvailable = false;
 
         function showTab(tabName, button) {
@@ -835,6 +878,7 @@ void handleRoot()
             document.querySelectorAll('section[id]').forEach(section => section.classList.add('hidden'));
             document.getElementById(tabName).classList.remove('hidden');
             if (tabName === 'wifi') wifiScan();
+            if (tabName === 'cards') loadCards();
     }
 
     async function refreshStatus() {
@@ -852,7 +896,6 @@ void handleRoot()
                 document.getElementById('lastUid').textContent = data.lastUid || 'None';
                 document.getElementById('currentVersion').textContent = data.firmwareVersion || '--';
                 updateUnlockControl(data);
-                renderTags(data.tags || []);
             } catch (error) {
                 document.getElementById('connectionState').textContent = 'Device unavailable';
                 document.getElementById('connectionState').classList.remove('online');
@@ -894,6 +937,7 @@ void handleRoot()
                 if (form.id === 'manualCardForm') {
                     feedback.textContent = 'Card added.';
                     form.reset();
+                    await loadCards(cardsOffset);
                     await refreshStatus();
                 } else {
                     feedback.textContent = 'Changes saved.';
@@ -961,6 +1005,35 @@ void handleRoot()
             }
             table.replaceChildren(rows);
     }
+
+        async function loadCards(offset = cardsOffset) {
+            if (cardsRequestPending) return;
+            cardsRequestPending = true;
+            document.getElementById('cardsPageInfo').textContent = 'Loading cards...';
+            try {
+                const response = await fetch('/api/cards?offset=' + offset + '&limit=' + cardsPageSize, { cache: 'no-store' });
+                if (!response.ok) throw new Error('Could not load cards.');
+                const data = await response.json();
+                cardsOffset = Number(data.offset) || 0;
+                cardsTotal = Number(data.total) || 0;
+                const cards = data.cards || [];
+                renderTags(cards);
+                const first = cards.length ? cardsOffset + 1 : 0;
+                const last = cardsOffset + cards.length;
+                document.getElementById('cardsPageInfo').textContent = cardsTotal ? 'Showing ' + first + '-' + last + ' of ' + cardsTotal : 'No cards stored.';
+                document.getElementById('previousCardsButton').disabled = cardsOffset === 0;
+                document.getElementById('nextCardsButton').disabled = last >= cardsTotal;
+            } catch (error) {
+                document.getElementById('cardsPageInfo').textContent = error.message || 'Could not load cards.';
+            } finally {
+                cardsRequestPending = false;
+            }
+        }
+
+        function changeCardsPage(direction) {
+            const nextOffset = cardsOffset + direction * cardsPageSize;
+            if (nextOffset >= 0 && nextOffset < cardsTotal) loadCards(nextOffset);
+        }
 
     async function wifiScan() {
             const button = document.getElementById('wifiScanButton');
@@ -1031,6 +1104,7 @@ void handleRoot()
                 const added = await fetch('/api/add-tag', { method: 'POST', body: new URLSearchParams({ uid: data.uid, name: holderName }) });
                 if (!added.ok) throw new Error('Could not add this card');
                 statusEl.textContent = 'Card assigned to ' + holderName + ': ' + data.uid;
+                await loadCards(cardsOffset);
                 await refreshStatus();
             } catch (error) {
                 statusEl.textContent = error.message;
@@ -1105,8 +1179,11 @@ void handleRoot()
     async function removeTag(uid) {
       const formData = new FormData();
       formData.append('uid', uid);
-      await fetch('/api/remove-tag', { method: 'POST', body: formData });
-      refreshStatus();
+    const response = await fetch('/api/remove-tag', { method: 'POST', body: formData });
+    if (!response.ok) return;
+    if (cardsOffset > 0 && cardsOffset >= cardsTotal - 1) cardsOffset -= cardsPageSize;
+    await loadCards(cardsOffset);
+    await refreshStatus();
     }
 
     async function restartDevice() {
@@ -1135,6 +1212,44 @@ void handleStatus()
 {
     String response = buildStatusJson();
     server.send(200, "application/json", response);
+}
+
+void handleCardsPage()
+{
+    long requestedOffset = server.arg("offset").toInt();
+    long requestedLimit = server.arg("limit").toInt();
+    if (requestedOffset < 0)
+    {
+        requestedOffset = 0;
+    }
+    if (requestedLimit <= 0 || requestedLimit > 25)
+    {
+        requestedLimit = 25;
+    }
+    if (requestedOffset > authorizedTagCount)
+    {
+        requestedOffset = authorizedTagCount;
+    }
+
+    DynamicJsonDocument doc(4096);
+    doc["total"] = authorizedTagCount;
+    doc["offset"] = requestedOffset;
+    JsonArray cards = doc.createNestedArray("cards");
+    long end = requestedOffset + requestedLimit;
+    if (end > authorizedTagCount)
+    {
+        end = authorizedTagCount;
+    }
+    for (long i = requestedOffset; i < end; ++i)
+    {
+        JsonObject card = cards.createNestedObject();
+        card["uid"] = authorizedTags[i].uid;
+        card["name"] = authorizedTags[i].holderName;
+    }
+
+    String output;
+    serializeJson(doc, output);
+    server.send(200, "application/json", output);
 }
 
 void handleSettings()
@@ -1363,6 +1478,7 @@ void setup()
 
     server.on("/", HTTP_GET, handleRoot);
     server.on("/api/status", HTTP_GET, handleStatus);
+    server.on("/api/cards", HTTP_GET, handleCardsPage);
     server.on("/api/update-check", HTTP_GET, handleUpdateCheck);
     server.on("/api/settings", HTTP_GET, handleSettingsRead);
     server.on("/api/wifi-scan", HTTP_GET, []() {
