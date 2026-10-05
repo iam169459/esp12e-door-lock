@@ -695,10 +695,11 @@ void handleRoot()
             <h2>Card manager</h2>
             <div class="actions"><button id="scanCardButton" class="secondary" type="button" onclick="scanAndAddCard()">Scan and add card</button></div>
             <p id="scanStatus" class="scanResult" role="status" aria-live="polite">Waiting for scan.</p>
-            <form method="POST" action="/api/add-tag">
+            <form id="manualCardForm" data-feedback="manualCardFeedback" method="POST" action="/api/add-tag">
                 <label for="manualUid">Add a card UID manually</label>
                 <input name="uid" id="manualUid" placeholder="For example, 01A2B3C4" required />
                 <button type="submit">Add card</button>
+                <p id="manualCardFeedback" class="feedback" role="status" aria-live="polite"></p>
             </form>
             <table aria-label="Authorized cards">
                 <thead><tr><th>Card UID</th><th>Action</th></tr></thead>
@@ -708,7 +709,7 @@ void handleRoot()
 
         <section id="settings" class="card hidden">
             <h2>Device settings</h2>
-            <form method="POST" action="/api/settings">
+            <form id="deviceSettingsForm" data-feedback="deviceSettingsFeedback" method="POST" action="/api/settings">
                 <label for="wifiSsid">Wi-Fi network</label>
                 <input id="wifiSsid" name="wifiSsid" required />
                 <label for="wifiPassword">New Wi-Fi password</label>
@@ -716,14 +717,16 @@ void handleRoot()
                 <label for="unlockMs">Unlock duration (milliseconds)</label>
                 <input id="unlockMs" name="unlockMs" type="number" min="500" max="30000" value="3000" required />
                 <button type="submit">Save device settings</button>
+                <p id="deviceSettingsFeedback" class="feedback" role="status" aria-live="polite"></p>
             </form>
 
             <h3>Google Sheets logging</h3>
-            <form method="POST" action="/api/settings">
+            <form id="sheetsSettingsForm" data-feedback="sheetsSettingsFeedback" method="POST" action="/api/settings">
                 <label for="googleSheetUrl">Apps Script URL</label>
                 <input id="googleSheetUrl" name="googleSheetUrl" type="url" placeholder="https://script.google.com/.../exec" />
                 <div class="check-row"><input id="googleLoggingEnabled" name="googleLoggingEnabled" type="checkbox" /><label for="googleLoggingEnabled">Enable access logging</label></div>
                 <button type="submit">Save logging settings</button>
+                <p id="sheetsSettingsFeedback" class="feedback" role="status" aria-live="polite"></p>
                 <div class="actions"><button class="secondary" type="button" onclick="testSheetsConnection()">Test connection</button></div>
                 <p id="sheetsTestStatus" class="feedback" role="status" aria-live="polite"></p>
             </form>
@@ -749,6 +752,7 @@ void handleRoot()
         let unlockPending = false;
         let cardScanPending = false;
         let updateCheckPending = false;
+        let statusRefreshPending = false;
         let updateAvailable = false;
 
         function showTab(tabName, button) {
@@ -763,6 +767,8 @@ void handleRoot()
     }
 
     async function refreshStatus() {
+            if (statusRefreshPending || document.hidden) return;
+            statusRefreshPending = true;
             try {
                 const response = await fetch('/api/status', { cache: 'no-store' });
                 if (!response.ok) throw new Error('Status request failed');
@@ -779,6 +785,8 @@ void handleRoot()
             } catch (error) {
                 document.getElementById('connectionState').textContent = 'Device unavailable';
                 document.getElementById('connectionState').classList.remove('online');
+            } finally {
+                statusRefreshPending = false;
             }
         }
 
@@ -793,6 +801,38 @@ void handleRoot()
                 document.getElementById('googleLoggingEnabled').checked = Boolean(data.googleLoggingEnabled);
             } catch (error) {
                 document.getElementById('unlockFeedback').textContent = 'Could not load saved settings.';
+            }
+        }
+
+        async function submitWithoutReload(event) {
+            event.preventDefault();
+            const form = event.currentTarget;
+            const button = form.querySelector('button[type="submit"]');
+            const feedback = document.getElementById(form.dataset.feedback);
+            const idleLabel = button.textContent;
+            const formData = new FormData(form);
+            const values = new URLSearchParams();
+            formData.forEach((value, key) => values.append(key, value));
+            button.disabled = true;
+            button.textContent = 'Saving...';
+            feedback.textContent = '';
+
+            try {
+                const response = await fetch(form.action, { method: form.method, body: values });
+                if (!response.ok) throw new Error('Could not save changes.');
+                if (form.id === 'manualCardForm') {
+                    feedback.textContent = 'Card added.';
+                    form.reset();
+                    await refreshStatus();
+                } else {
+                    feedback.textContent = 'Changes saved.';
+                    await loadSettings();
+                }
+            } catch (error) {
+                feedback.textContent = error.message || 'Could not save changes.';
+            } finally {
+                button.disabled = false;
+                button.textContent = idleLabel;
             }
         }
 
@@ -979,11 +1019,18 @@ void handleRoot()
     async function restartDevice() {
             if (confirm('Restart the door lock now?')) await fetch('/api/restart', { method: 'POST' });
     }
+        document.querySelectorAll('form[data-feedback]').forEach(form => form.addEventListener('submit', submitWithoutReload));
     refreshStatus();
     loadSettings();
         checkForUpdates();
-        setInterval(refreshStatus, 1000);
+                setInterval(refreshStatus, 1500);
         setInterval(checkForUpdates, 15 * 60 * 1000);
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) {
+                refreshStatus();
+                loadSettings();
+            }
+        });
   </script>
 </body>
 </html>
