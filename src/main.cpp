@@ -35,7 +35,8 @@ const char *TAGS_FILE = "/tags.json";
 const char *FIRMWARE_VERSION = APP_VERSION;
 const char *REPO_OTA_URL = "https://github.com/iam169459/esp12e-door-lock/releases/latest/download/firmware.bin";
 const char *GITHUB_RELEASE_API = "https://api.github.com/repos/iam169459/esp12e-door-lock/releases/latest";
-constexpr unsigned long RFID_REPEAT_GUARD_MS = 5000;
+constexpr unsigned long RFID_REPEAT_GUARD_MS = 750;
+constexpr unsigned long RFID_SCAN_POLL_MS = 10;
 constexpr unsigned long RELEASE_CHECK_INTERVAL_MS = 15UL * 60UL * 1000UL;
 
 struct DeviceSettings
@@ -314,7 +315,7 @@ bool postToGoogleSheet(const String &eventType, const String &uid, const String 
     WiFiClientSecure client;
     client.setInsecure();
     HTTPClient http;
-    http.setTimeout(20000);
+    http.setTimeout(testRequest ? 20000 : 4000);
     if (!http.begin(client, settings.googleSheetUrl))
     {
         lastSheetsError = "Could not open the Apps Script URL";
@@ -346,7 +347,7 @@ bool postToGoogleSheet(const String &eventType, const String &uid, const String 
         WiFiClientSecure redirectClient;
         redirectClient.setInsecure();
         HTTPClient redirect;
-        redirect.setTimeout(20000);
+        redirect.setTimeout(testRequest ? 20000 : 4000);
         redirect.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
         if (!redirect.begin(redirectClient, redirectLocation))
         {
@@ -1147,7 +1148,7 @@ void handleRfidRead()
 
     String uid = uidToString(mfrc522.uid.uidByte, mfrc522.uid.size);
     unsigned long now = millis();
-    unsigned long repeatGuardMs = settings.unlockMs + 1000UL;
+    unsigned long repeatGuardMs = settings.unlockMs + 250UL;
     if (repeatGuardMs < RFID_REPEAT_GUARD_MS)
     {
         repeatGuardMs = RFID_REPEAT_GUARD_MS;
@@ -1230,7 +1231,7 @@ void setup()
                 {
                     break;
                 }
-                delay(50);
+                delay(RFID_SCAN_POLL_MS);
             }
         }
 
@@ -1277,7 +1278,7 @@ void loop()
         connectToWifi();
     }
 
-    delay(50);
+    delay(RFID_SCAN_POLL_MS);
 }
 
 void handleSheetsTest()
