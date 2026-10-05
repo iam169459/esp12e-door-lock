@@ -29,8 +29,14 @@ const char *AP_SSID = "DoorLock-Setup";
 const char *AP_PASSWORD = "12345678";
 const char *SETTINGS_FILE = "/settings.json";
 const char *TAGS_FILE = "/tags.json";
-const char *FIRMWARE_VERSION = "1.0.0";
+#ifndef APP_VERSION
+#define APP_VERSION "1.0.0"
+#endif
+const char *FIRMWARE_VERSION = APP_VERSION;
 const char *REPO_OTA_URL = "https://github.com/iam169459/esp12e-door-lock/releases/latest/download/firmware.bin";
+const char *GITHUB_RELEASE_API = "https://api.github.com/repos/iam169459/esp12e-door-lock/releases/latest";
+constexpr unsigned long RFID_REPEAT_GUARD_MS = 5000;
+constexpr unsigned long RELEASE_CHECK_INTERVAL_MS = 15UL * 60UL * 1000UL;
 
 struct DeviceSettings
 {
@@ -38,7 +44,6 @@ struct DeviceSettings
     String wifiPassword = DEFAULT_WIFI_PASSWORD;
     String googleSheetUrl = "";
     bool googleLoggingEnabled = false;
-    String githubFirmwareUrl = REPO_OTA_URL;
     uint16_t unlockMs = 3000;
 };
 
@@ -47,8 +52,17 @@ String authorizedTags[32];
 uint8_t authorizedTagCount = 0;
 String lastUid = "";
 String lastStatus = "idle";
+String lastProcessedRfidUid = "";
+unsigned long lastProcessedRfidAt = 0;
 bool relayOpen = false;
+bool hasUnlockedSinceBoot = false;
+unsigned long relayActivatedAt = 0;
 bool doorOpen = false;
+bool updateCheckCached = false;
+bool updateAvailable = false;
+unsigned long lastUpdateCheckAt = 0;
+String latestFirmwareVersion = "";
+String latestReleasePage = "";
 ESP8266WebServer server(80);
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 
@@ -107,7 +121,6 @@ void loadSettings()
         settings.wifiPassword = DEFAULT_WIFI_PASSWORD;
         settings.googleSheetUrl = "";
         settings.googleLoggingEnabled = false;
-        settings.githubFirmwareUrl = REPO_OTA_URL;
         settings.unlockMs = 3000;
         return;
     }
@@ -135,10 +148,6 @@ void loadSettings()
     {
         settings.googleLoggingEnabled = doc["googleLoggingEnabled"].as<bool>();
     }
-    if (doc.containsKey("githubFirmwareUrl"))
-    {
-        settings.githubFirmwareUrl = doc["githubFirmwareUrl"].as<String>();
-    }
     if (doc.containsKey("unlockMs"))
     {
         settings.unlockMs = doc["unlockMs"].as<uint16_t>();
@@ -152,7 +161,6 @@ void saveSettings()
     doc["wifiPassword"] = settings.wifiPassword;
     doc["googleSheetUrl"] = settings.googleSheetUrl;
     doc["googleLoggingEnabled"] = settings.googleLoggingEnabled;
-    doc["githubFirmwareUrl"] = settings.githubFirmwareUrl;
     doc["unlockMs"] = settings.unlockMs;
 
     String out;
@@ -269,11 +277,24 @@ void setRelay(bool open)
 
 void unlockDoor()
 {
+    if (relayOpen)
+    {
+        return;
+    }
+
     setRelay(true);
+    relayActivatedAt = millis();
+    hasUnlockedSinceBoot = true;
     lastStatus = "unlocked";
-    delay(settings.unlockMs);
+}
+
+void updateRelay()
+{
+    if (relayOpen && millis() - relayActivatedAt >= settings.unlockMs)
+    {
     setRelay(false);
     lastStatus = "locked";
+    }
 }
 
 bool postToGoogleSheet(const String &eventType, const String &uid, const String &note)
@@ -308,7 +329,10 @@ bool installFirmwareFromUrl(const String &url)
     }
 
     HTTPClient http;
-    WiFiClient client;
+    WiFiClientSecure client;
+    client.setInsecure();
+    http.setTimeout(15000);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     if (!http.begin(client, url))
     {
         return false;
@@ -352,6 +376,78 @@ bool installFirmwareFromUrl(const String &url)
     return true;
 }
 
+bool fetchLatestRelease()
+{
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        return false;
+    }
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setTimeout(5000);
+    if (!http.begin(client, GITHUB_RELEASE_API))
+    {
+        return false;
+    }
+
+    http.addHeader("Accept", "application/vnd.github+json");
+    http.addHeader("User-Agent", "ESP12E-Door-Lock");
+    int code = http.GET();
+    if (code != HTTP_CODE_OK)
+    {
+        http.end();
+        return false;
+    }
+
+    DynamicJsonDocument filter(128);
+    filter["tag_name"] = true;
+    filter["html_url"] = true;
+    DynamicJsonDocument release(384);
+    DeserializationError error = deserializeJson(release, http.getStream(), DeserializationOption::Filter(filter));
+    http.end();
+    if (error || !release["tag_name"].is<const char *>())
+    {
+        return false;
+    }
+
+    latestFirmwareVersion = release["tag_name"].as<String>();
+    latestReleasePage = release["html_url"].as<String>();
+    String normalizedVersion = latestFirmwareVersion;
+    if (normalizedVersion.startsWith("v") || normalizedVersion.startsWith("V"))
+    {
+        normalizedVersion.remove(0, 1);
+    }
+    updateAvailable = normalizedVersion != FIRMWARE_VERSION;
+    lastUpdateCheckAt = millis();
+    updateCheckCached = true;
+    return true;
+}
+
+void handleUpdateCheck()
+{
+    bool forceRefresh = server.hasArg("refresh") && server.arg("refresh") == "1";
+    if (forceRefresh || !updateCheckCached || millis() - lastUpdateCheckAt >= RELEASE_CHECK_INTERVAL_MS)
+    {
+        if (!fetchLatestRelease())
+        {
+            server.send(503, "application/json", "{\"ok\":false,\"error\":\"Unable to check GitHub releases\"}");
+            return;
+        }
+    }
+
+    DynamicJsonDocument response(384);
+    response["ok"] = true;
+    response["currentVersion"] = FIRMWARE_VERSION;
+    response["latestVersion"] = latestFirmwareVersion;
+    response["updateAvailable"] = updateAvailable;
+    response["releaseUrl"] = latestReleasePage;
+    String output;
+    serializeJson(response, output);
+    server.send(200, "application/json", output);
+}
+
 String buildStatusJson()
 {
     DynamicJsonDocument doc(512);
@@ -361,6 +457,9 @@ String buildStatusJson()
     doc["ip"] = WiFi.localIP().toString();
     doc["ssid"] = WiFi.SSID();
     doc["firmwareVersion"] = FIRMWARE_VERSION;
+    unsigned long elapsedSinceUnlock = millis() - relayActivatedAt;
+    unsigned long unlockCooldownMs = settings.unlockMs + 1000UL;
+    doc["unlockCooldownMs"] = hasUnlockedSinceBoot && elapsedSinceUnlock < unlockCooldownMs ? unlockCooldownMs - elapsedSinceUnlock : 0;
     doc["tagCount"] = authorizedTagCount;
     doc["lastUid"] = lastUid;
     JsonArray tags = doc.createNestedArray("tags");
@@ -408,6 +507,17 @@ bool readCardUidIfPresent(String &uidOut)
     return true;
 }
 
+String escapeHtmlAttribute(const String &value)
+{
+    String escaped = value;
+    escaped.replace("&", "&amp;");
+    escaped.replace("\"", "&quot;");
+    escaped.replace("'", "&#39;");
+    escaped.replace("<", "&lt;");
+    escaped.replace(">", "&gt;");
+    return escaped;
+}
+
 void handleRoot()
 {
     String page = R"HTML(
@@ -418,157 +528,344 @@ void handleRoot()
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>ESP12E Door Lock</title>
   <style>
-    body { font-family: Arial, sans-serif; background: #111827; color: #f3f4f6; margin: 0; padding: 20px; }
-    .wrap { max-width: 1000px; margin: 0 auto; }
-    .card { background: #1f2937; border-radius: 12px; padding: 16px; margin-bottom: 20px; box-shadow: 0 10px 25px rgba(0,0,0,0.2); }
-    h1, h2, h3 { margin-top: 0; }
-    label { display: block; margin: 8px 0 6px; }
-    input, button, select { width: 100%; box-sizing: border-box; padding: 10px; border-radius: 8px; border: none; margin-bottom: 10px; }
-    button { background: #22c55e; color: white; font-weight: bold; cursor: pointer; }
-    button.secondary { background: #3b82f6; }
-    button.warn { background: #ef4444; }
-    .tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
-    .tab { background: #374151; color: white; border-radius: 8px; padding: 10px 16px; cursor: pointer; }
-    .tab.active { background: #22c55e; }
-    .hidden { display: none; }
-    .status { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #374151; }
-    .scanResult { margin-top: 8px; font-weight: bold; }
+        :root { color-scheme: dark; --bg: #111916; --surface: #1b2521; --surface-raised: #26332d; --text: #f3f6f2; --muted: #a6b5aa; --line: #39483f; --green: #70d1a2; --amber: #efb263; --red: #ed766e; }
+        * { box-sizing: border-box; }
+        body { font-family: "Avenir Next", "Trebuchet MS", sans-serif; background: linear-gradient(145deg, #101714, #17201e 58%, #171d25); color: var(--text); margin: 0; min-height: 100vh; padding: 24px; }
+        .wrap { max-width: 920px; margin: 0 auto; }
+        .topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
+        .brand { display: flex; align-items: center; gap: 12px; }
+        .brand-mark { display: grid; place-items: center; width: 42px; aspect-ratio: 1; border-radius: 8px; background: var(--green); color: #10251b; font-weight: 800; }
+        .eyebrow { color: var(--green); font-size: 11px; font-weight: 700; margin: 0 0 4px; }
+        h1, h2, h3, p { margin-top: 0; }
+        h1 { font-size: 24px; margin-bottom: 0; }
+        h2 { font-size: 20px; margin-bottom: 16px; }
+        h3 { font-size: 16px; margin: 28px 0 10px; }
+        .connection { color: var(--muted); font-size: 13px; }
+        .connection::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 8px; border-radius: 50%; background: var(--amber); }
+        .connection.online::before { background: var(--green); }
+        .tabs { display: flex; gap: 4px; overflow-x: auto; margin-bottom: 16px; border-bottom: 1px solid var(--line); }
+        .tab { flex: 0 0 auto; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); padding: 12px 15px; font: inherit; cursor: pointer; }
+        .tab.active { color: var(--text); border-bottom-color: var(--green); }
+        .card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 22px; }
+        .hidden { display: none !important; }
+        .status { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 10px; margin-bottom: 20px; }
+        .metric { padding: 12px; background: var(--surface-raised); border-radius: 6px; }
+        .metric strong { display: block; color: var(--muted); font-size: 12px; font-weight: 600; margin-bottom: 6px; }
+        .metric span { overflow-wrap: anywhere; }
+        .actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+        button { min-height: 42px; border: 1px solid transparent; border-radius: 6px; padding: 10px 14px; background: var(--green); color: #10251b; font: inherit; font-weight: 700; cursor: pointer; }
+        button.secondary { background: var(--surface-raised); color: var(--text); border-color: var(--line); }
+        button.warn { background: transparent; border-color: var(--red); color: var(--red); }
+        button:disabled { opacity: .55; cursor: not-allowed; }
+        .actions button { width: auto; margin: 0; }
+        .feedback, .muted { color: var(--muted); font-size: 13px; }
+        .feedback { min-height: 20px; margin: 12px 0 0; }
+        label { display: block; margin: 12px 0 6px; color: var(--muted); font-size: 13px; }
+        input { width: 100%; min-height: 42px; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; margin-bottom: 8px; background: #111916; color: var(--text); font: inherit; }
+        input[type=checkbox] { width: 18px; min-height: 18px; vertical-align: middle; accent-color: var(--green); }
+        input[readonly] { color: var(--muted); }
+        form { max-width: 560px; }
+        .check-row { display: flex; align-items: center; gap: 8px; }
+        .check-row label { display: inline; margin: 0; }
+        table { width: 100%; border-collapse: collapse; margin-top: 14px; }
+        th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); }
+        th { color: var(--muted); font-size: 12px; font-weight: 600; }
+        td button { min-height: 34px; padding: 6px 10px; }
+        .scanResult { margin: 12px 0; color: var(--muted); }
+        .update-panel { padding: 14px; margin: 14px 0; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-raised); }
+        .update-panel.available { border-color: var(--amber); }
+        .update-panel p { margin-bottom: 10px; }
+        a { color: var(--green); }
+        @media (max-width: 560px) { body { padding: 14px; } .topbar { align-items: flex-start; } .card { padding: 16px; } .tabs { margin-left: -4px; margin-right: -4px; } .actions { align-items: stretch; } .actions button { flex: 1 1 100%; } table { font-size: 13px; } }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="tabs">
-      <div class="tab active" onclick="showTab('dashboard')">Dashboard</div>
-      <div class="tab" onclick="showTab('wifi')">Wi-Fi Scan</div>
-      <div class="tab" onclick="showTab('cards')">Card Manager</div>
-      <div class="tab" onclick="showTab('settings')">Settings</div>
-      <div class="tab" onclick="showTab('ota')">OTA</div>
-    </div>
+        <header class="topbar">
+            <div class="brand"><div class="brand-mark" aria-hidden="true">DL</div><div><p class="eyebrow">ACCESS CONTROL</p><h1>Door Lock</h1></div></div>
+            <div id="connectionState" class="connection">Connecting</div>
+        </header>
+        <nav class="tabs" aria-label="Main navigation">
+            <button class="tab active" type="button" data-tab="dashboard" aria-selected="true" onclick="showTab('dashboard', this)">Dashboard</button>
+            <button class="tab" type="button" data-tab="wifi" aria-selected="false" onclick="showTab('wifi', this)">Wi-Fi</button>
+            <button class="tab" type="button" data-tab="cards" aria-selected="false" onclick="showTab('cards', this)">Cards</button>
+            <button class="tab" type="button" data-tab="settings" aria-selected="false" onclick="showTab('settings', this)">Settings</button>
+            <button class="tab" type="button" data-tab="ota" aria-selected="false" onclick="showTab('ota', this)">Firmware</button>
+        </nav>
 
-    <div id="dashboard" class="card">
-      <h1>Door Lock Control</h1>
-      <div class="status">
-        <div><strong>Door:</strong> <span id="doorState">--</span></div>
-        <div><strong>Relay:</strong> <span id="relayState">--</span></div>
-        <div><strong>IP:</strong> <span id="ipAddr">--</span></div>
-        <div><strong>Last UID:</strong> <span id="lastUid">--</span></div>
-      </div>
-      <br>
-      <button onclick="unlockDoor()">Unlock Door</button>
-      <button class="secondary" onclick="refreshStatus()">Refresh</button>
-      <button class="warn" onclick="restartDevice()">Restart</button>
-    </div>
+        <section id="dashboard" class="card">
+            <p class="eyebrow">OVERVIEW</p>
+            <h2>Lock status</h2>
+            <div class="status">
+                <div class="metric"><strong>Door</strong><span id="doorState">--</span></div>
+                <div class="metric"><strong>Relay</strong><span id="relayState">--</span></div>
+                <div class="metric"><strong>Device address</strong><span id="ipAddr">--</span></div>
+                <div class="metric"><strong>Last card</strong><span id="lastUid">--</span></div>
+            </div>
+            <div class="actions">
+                <button id="unlockButton" type="button" onclick="unlockDoor()">Unlock door</button>
+                <button class="secondary" type="button" onclick="refreshStatus()">Refresh status</button>
+                <button class="warn" type="button" onclick="restartDevice()">Restart device</button>
+            </div>
+            <p id="unlockFeedback" class="feedback" role="status" aria-live="polite">Ready.</p>
+        </section>
 
-    <div id="wifi" class="card hidden">
-      <h2>Wi-Fi Scan</h2>
-      <button class="secondary" onclick="wifiScan()">Scan Wi-Fi Networks</button>
-      <table>
-        <thead><tr><th>SSID</th><th>RSSI</th><th>Type</th></tr></thead>
-        <tbody id="wifiTable"></tbody>
-      </table>
-    </div>
+        <section id="wifi" class="card hidden">
+            <h2>Nearby Wi-Fi</h2>
+            <div class="actions"><button id="wifiScanButton" class="secondary" type="button" onclick="wifiScan()">Scan networks</button></div>
+            <table aria-label="Available Wi-Fi networks">
+                <thead><tr><th>Network</th><th>Signal</th><th>Security</th></tr></thead>
+                <tbody id="wifiTable"><tr><td colspan="3">Select scan to search.</td></tr></tbody>
+            </table>
+        </section>
 
-    <div id="cards" class="card hidden">
-      <h2>Card Manager</h2>
-      <button class="secondary" onclick="scanAndAddCard()">Scan Card and Add</button>
-      <div id="scanStatus" class="scanResult">Waiting for card...</div>
-      <form method="POST" action="/api/add-tag">
-        <label>RFID UID</label>
-        <input name="uid" id="manualUid" placeholder="e.g. 01A2B3C4" />
-        <button type="submit">Add Card Manually</button>
-      </form>
-      <table>
-        <thead><tr><th>UID</th><th>Action</th></tr></thead>
-        <tbody id="tagTable"></tbody>
-      </table>
-    </div>
+        <section id="cards" class="card hidden">
+            <h2>Card manager</h2>
+            <div class="actions"><button id="scanCardButton" class="secondary" type="button" onclick="scanAndAddCard()">Scan and add card</button></div>
+            <p id="scanStatus" class="scanResult" role="status" aria-live="polite">Waiting for scan.</p>
+            <form method="POST" action="/api/add-tag">
+                <label for="manualUid">Add a card UID manually</label>
+                <input name="uid" id="manualUid" placeholder="For example, 01A2B3C4" required />
+                <button type="submit">Add card</button>
+            </form>
+            <table aria-label="Authorized cards">
+                <thead><tr><th>Card UID</th><th>Action</th></tr></thead>
+                <tbody id="tagTable"></tbody>
+            </table>
+        </section>
 
-    <div id="settings" class="card hidden">
-      <h2>Wi-Fi Setup</h2>
-      <form method="POST" action="/api/settings">
-        <label>SSID</label>
-        <input name="wifiSsid" value="purple" />
-        <label>Password</label>
-        <input name="wifiPassword" type="password" value="refat123" />
-        <label>Unlock time (ms)</label>
-        <input name="unlockMs" type="number" value="3000" />
-        <label>GitHub OTA URL</label>
-        <input name="githubFirmwareUrl" type="url" value="https://github.com/your-user/your-repo/releases/latest/download/firmware.bin" />
-        <button type="submit">Save Settings</button>
-      </form>
+        <section id="settings" class="card hidden">
+            <h2>Device settings</h2>
+            <form method="POST" action="/api/settings">
+                <label for="wifiSsid">Wi-Fi network</label>
+                <input id="wifiSsid" name="wifiSsid" value="{{WIFI_SSID}}" required />
+                <label for="wifiPassword">New Wi-Fi password</label>
+                <input id="wifiPassword" name="wifiPassword" type="password" autocomplete="new-password" placeholder="Leave blank to keep current password" />
+                <label for="unlockMs">Unlock duration (milliseconds)</label>
+                <input id="unlockMs" name="unlockMs" type="number" min="500" max="30000" value="{{UNLOCK_MS}}" required />
+                <button type="submit">Save device settings</button>
+            </form>
 
-      <h3>Google Sheets Logging</h3>
-      <form method="POST" action="/api/settings">
-        <label>Google Apps Script URL</label>
-        <input name="googleSheetUrl" type="url" placeholder="https://script.google.com/.../exec" />
-        <label><input name="googleLoggingEnabled" type="checkbox" /> Enable Google logging</label>
-        <button type="submit">Save Logging</button>
-      </form>
-    </div>
+            <h3>Google Sheets logging</h3>
+            <form method="POST" action="/api/settings">
+                <label for="googleSheetUrl">Apps Script URL</label>
+                <input id="googleSheetUrl" name="googleSheetUrl" type="url" value="{{SHEET_URL}}" placeholder="https://script.google.com/.../exec" />
+                <div class="check-row"><input id="googleLoggingEnabled" name="googleLoggingEnabled" type="checkbox" {{LOGGING_CHECKED}} /><label for="googleLoggingEnabled">Enable access logging</label></div>
+                <button type="submit">Save logging settings</button>
+            </form>
+        </section>
 
-    <div id="ota" class="card hidden">
-      <h2>GitHub OTA</h2>
-      <form method="POST" action="/api/ota">
-        <label>Firmware URL</label>
-        <input name="url" type="url" placeholder="https://github.com/.../releases/latest/download/firmware.bin" />
-        <button type="submit">Update Firmware</button>
-      </form>
-    </div>
+        <section id="ota" class="card hidden">
+            <h2>Firmware updates</h2>
+            <p class="muted">Installed version: <span id="currentVersion">{{CURRENT_VERSION}}</span></p>
+            <div id="updatePanel" class="update-panel">
+                <p id="updateMessage" role="status" aria-live="polite">Checking for updates...</p>
+                <div class="actions">
+                      <button id="checkUpdatesButton" class="secondary" type="button" onclick="checkForUpdates(true)">Check now</button>
+                      <button id="installUpdateButton" type="button" onclick="installLatestFirmware()" disabled>Install update</button>
+                </div>
+                <p><a id="releaseLink" class="hidden" href="#" target="_blank" rel="noopener noreferrer">View release notes</a></p>
+            </div>
+            <label for="firmwareSource">Fixed firmware source</label>
+            <input id="firmwareSource" type="url" value="{{OTA_URL}}" readonly />
+        </section>
   </div>
 
   <script>
-    function showTab(tabName) {
-      const tabs = document.querySelectorAll('.tab');
-      tabs.forEach(tab => tab.classList.remove('active'));
-      const activeTab = Array.from(tabs).find(tab => tab.textContent.trim() === tabName || tab.onclick && tab.onclick.toString().includes(tabName));
-      if (activeTab) activeTab.classList.add('active');
+        let unlockPending = false;
+        let cardScanPending = false;
+        let updateCheckPending = false;
+        let updateAvailable = false;
 
-      document.getElementById('dashboard').classList.add('hidden');
-      document.getElementById('wifi').classList.add('hidden');
-      document.getElementById('cards').classList.add('hidden');
-      document.getElementById('settings').classList.add('hidden');
-      document.getElementById('ota').classList.add('hidden');
-      document.getElementById(tabName).classList.remove('hidden');
+        function showTab(tabName, button) {
+            document.querySelectorAll('.tab').forEach(tab => {
+                const active = tab === button;
+                tab.classList.toggle('active', active);
+                tab.setAttribute('aria-selected', active ? 'true' : 'false');
+            });
+            document.querySelectorAll('section[id]').forEach(section => section.classList.add('hidden'));
+            document.getElementById(tabName).classList.remove('hidden');
+            if (tabName === 'wifi') wifiScan();
     }
 
     async function refreshStatus() {
-      const res = await fetch('/api/status');
-      const data = await res.json();
-      document.getElementById('doorState').textContent = data.doorOpen ? 'Open' : 'Closed';
-      document.getElementById('relayState').textContent = data.relayOpen ? 'Open' : 'Closed';
-      document.getElementById('ipAddr').textContent = data.ip || '--';
-      document.getElementById('lastUid').textContent = data.lastUid || '--';
-      const rows = data.tags.map(tag => '<tr><td>' + tag + '</td><td><button class="warn" onclick="removeTag(\'' + tag + '\')">Remove</button></td></tr>').join('');
-      document.getElementById('tagTable').innerHTML = rows;
+            try {
+                const response = await fetch('/api/status', { cache: 'no-store' });
+                if (!response.ok) throw new Error('Status request failed');
+                const data = await response.json();
+                document.getElementById('connectionState').textContent = 'Device online';
+                document.getElementById('connectionState').classList.add('online');
+                document.getElementById('doorState').textContent = data.doorOpen ? 'Open' : 'Closed';
+                document.getElementById('relayState').textContent = data.relayOpen ? 'Unlocking' : 'Locked';
+                document.getElementById('ipAddr').textContent = data.ip || '--';
+                document.getElementById('lastUid').textContent = data.lastUid || 'None';
+                document.getElementById('currentVersion').textContent = data.firmwareVersion || '--';
+                updateUnlockControl(data);
+                renderTags(data.tags || []);
+            } catch (error) {
+                document.getElementById('connectionState').textContent = 'Device unavailable';
+                document.getElementById('connectionState').classList.remove('online');
+            }
+        }
+
+        function updateUnlockControl(data) {
+            const button = document.getElementById('unlockButton');
+            const feedback = document.getElementById('unlockFeedback');
+            const remainingMs = Number(data.unlockCooldownMs) || 0;
+            button.disabled = unlockPending || remainingMs > 0;
+            button.textContent = unlockPending ? 'Sending request...' : data.relayOpen ? 'Unlocking...' : remainingMs > 0 ? 'Wait ' + Math.ceil(remainingMs / 1000) + 's' : 'Unlock door';
+            if (data.relayOpen) feedback.textContent = 'Unlock pulse active.';
+            else if (remainingMs > 0) feedback.textContent = 'Unlock cooldown active.';
+            else if (!unlockPending) feedback.textContent = 'Ready.';
+        }
+
+        function renderTags(tags) {
+            const table = document.getElementById('tagTable');
+            const rows = document.createDocumentFragment();
+            tags.forEach(tag => {
+                const row = document.createElement('tr');
+                const uidCell = document.createElement('td');
+                uidCell.textContent = tag;
+                const actionCell = document.createElement('td');
+                const removeButton = document.createElement('button');
+                removeButton.type = 'button';
+                removeButton.className = 'warn';
+                removeButton.textContent = 'Remove';
+                removeButton.addEventListener('click', () => removeTag(tag));
+                actionCell.appendChild(removeButton);
+                row.append(uidCell, actionCell);
+                rows.appendChild(row);
+            });
+            if (!tags.length) {
+                const row = document.createElement('tr');
+                const cell = document.createElement('td');
+                cell.colSpan = 2;
+                cell.textContent = 'No authorized cards.';
+                row.appendChild(cell);
+                rows.appendChild(row);
+            }
+            table.replaceChildren(rows);
     }
 
     async function wifiScan() {
-      const res = await fetch('/api/wifi-scan');
-      const data = await res.json();
-      const rows = data.map(net => '<tr><td>' + net.ssid + '</td><td>' + net.rssi + '</td><td>' + net.enc + '</td></tr>').join('');
-      document.getElementById('wifiTable').innerHTML = rows || '<tr><td colspan="3">No networks found</td></tr>';
+            const button = document.getElementById('wifiScanButton');
+            button.disabled = true;
+            button.textContent = 'Scanning...';
+            try {
+                const response = await fetch('/api/wifi-scan');
+                if (!response.ok) throw new Error('Scan failed');
+                const networks = await response.json();
+                const table = document.getElementById('wifiTable');
+                const rows = document.createDocumentFragment();
+                networks.forEach(network => {
+                    const row = document.createElement('tr');
+                    [network.ssid, network.rssi + ' dBm', network.enc].forEach(value => {
+                        const cell = document.createElement('td');
+                        cell.textContent = value;
+                        row.appendChild(cell);
+                    });
+                    rows.appendChild(row);
+                });
+                if (!networks.length) {
+                    const row = document.createElement('tr');
+                    const cell = document.createElement('td');
+                    cell.colSpan = 3;
+                    cell.textContent = 'No networks found.';
+                    row.appendChild(cell);
+                    rows.appendChild(row);
+                }
+                table.replaceChildren(rows);
+            } catch (error) {
+                document.getElementById('wifiTable').textContent = 'Could not scan for networks.';
+            } finally {
+                button.disabled = false;
+                button.textContent = 'Scan networks';
+            }
     }
 
     async function scanAndAddCard() {
+            if (cardScanPending) return;
+            cardScanPending = true;
+            const button = document.getElementById('scanCardButton');
       const statusEl = document.getElementById('scanStatus');
-      statusEl.textContent = 'Hold card near reader...';
-      const res = await fetch('/api/scan-tag');
-      const data = await res.json();
-      if (data.ok) {
-        document.getElementById('manualUid').value = data.uid;
-        statusEl.textContent = 'Card detected: ' + data.uid;
-        await fetch('/api/add-tag', { method: 'POST', body: new URLSearchParams({ uid: data.uid }) });
-        refreshStatus();
-      } else {
-        statusEl.textContent = 'No card detected';
+            button.disabled = true;
+            button.textContent = 'Waiting for card...';
+            try {
+                const response = await fetch('/api/scan-tag');
+                const data = await response.json();
+                if (!response.ok || !data.ok) throw new Error(data.error || 'No card detected');
+                const added = await fetch('/api/add-tag', { method: 'POST', body: new URLSearchParams({ uid: data.uid }) });
+                if (!added.ok) throw new Error('Could not add this card');
+                statusEl.textContent = 'Card added: ' + data.uid;
+                await refreshStatus();
+            } catch (error) {
+                statusEl.textContent = error.message;
+            } finally {
+                cardScanPending = false;
+                button.disabled = false;
+                button.textContent = 'Scan and add card';
       }
     }
 
     async function unlockDoor() {
-      await fetch('/api/unlock', { method: 'POST' });
-      refreshStatus();
+            if (unlockPending) return;
+            unlockPending = true;
+            const button = document.getElementById('unlockButton');
+            button.disabled = true;
+            button.textContent = 'Sending request...';
+            try {
+                const response = await fetch('/api/unlock', { method: 'POST' });
+                const data = await response.json();
+                document.getElementById('unlockFeedback').textContent = response.status === 429 ? 'Unlock already active. Please wait.' : data.ok ? 'Unlock request accepted.' : 'Unlock request failed.';
+            } catch (error) {
+                document.getElementById('unlockFeedback').textContent = 'Could not reach the lock.';
+            } finally {
+                unlockPending = false;
+                await refreshStatus();
+            }
+        }
+
+        async function checkForUpdates(forceRefresh = false) {
+            if (updateCheckPending) return;
+            updateCheckPending = true;
+            const button = document.getElementById('checkUpdatesButton');
+            const panel = document.getElementById('updatePanel');
+            const message = document.getElementById('updateMessage');
+            button.disabled = true;
+            message.textContent = 'Checking GitHub for a release...';
+            try {
+                const response = await fetch('/api/update-check' + (forceRefresh ? '?refresh=1' : ''), { cache: 'no-store' });
+                const data = await response.json();
+                if (!response.ok || !data.ok) throw new Error(data.error || 'Update check failed');
+                updateAvailable = Boolean(data.updateAvailable);
+                panel.classList.toggle('available', updateAvailable);
+                message.textContent = updateAvailable ? 'Version ' + data.latestVersion + ' is available.' : 'Firmware is up to date (' + data.currentVersion + ').';
+                document.getElementById('installUpdateButton').disabled = !updateAvailable;
+                const releaseLink = document.getElementById('releaseLink');
+                if (data.releaseUrl && data.releaseUrl.startsWith('https://github.com/iam169459/esp12e-door-lock/releases/')) {
+                    releaseLink.href = data.releaseUrl;
+                    releaseLink.classList.remove('hidden');
+                }
+            } catch (error) {
+                message.textContent = error.message || 'Could not check for updates.';
+            } finally {
+                updateCheckPending = false;
+                button.disabled = false;
+            }
+        }
+
+        async function installLatestFirmware() {
+            const button = document.getElementById('installUpdateButton');
+            button.disabled = true;
+            document.getElementById('updateMessage').textContent = 'Downloading firmware...';
+            try {
+                const response = await fetch('/api/ota', { method: 'POST' });
+                if (!response.ok) throw new Error(await response.text());
+                document.getElementById('updateMessage').textContent = 'Firmware installed. Device is restarting...';
+            } catch (error) {
+                document.getElementById('updateMessage').textContent = error.message || 'Update failed.';
+                button.disabled = !updateAvailable;
+            }
     }
 
     async function removeTag(uid) {
@@ -579,14 +876,22 @@ void handleRoot()
     }
 
     async function restartDevice() {
-      await fetch('/api/restart', { method: 'POST' });
+            if (confirm('Restart the door lock now?')) await fetch('/api/restart', { method: 'POST' });
     }
     refreshStatus();
-    wifiScan();
+        checkForUpdates();
+        setInterval(refreshStatus, 1000);
+        setInterval(checkForUpdates, 15 * 60 * 1000);
   </script>
 </body>
 </html>
 )HTML";
+    page.replace("{{OTA_URL}}", escapeHtmlAttribute(String(REPO_OTA_URL)));
+    page.replace("{{WIFI_SSID}}", escapeHtmlAttribute(settings.wifiSSID));
+    page.replace("{{UNLOCK_MS}}", String(settings.unlockMs));
+    page.replace("{{CURRENT_VERSION}}", FIRMWARE_VERSION);
+    page.replace("{{SHEET_URL}}", escapeHtmlAttribute(settings.googleSheetUrl));
+    page.replace("{{LOGGING_CHECKED}}", settings.googleLoggingEnabled ? "checked" : "");
     server.send(200, "text/html", page);
 }
 
@@ -602,23 +907,28 @@ void handleSettings()
     {
         settings.wifiSSID = server.arg("wifiSsid");
     }
-    if (server.hasArg("wifiPassword"))
+    if (server.hasArg("wifiPassword") && server.arg("wifiPassword").length() > 0)
     {
         settings.wifiPassword = server.arg("wifiPassword");
     }
     if (server.hasArg("googleSheetUrl"))
     {
         settings.googleSheetUrl = server.arg("googleSheetUrl");
-    }
-    if (server.hasArg("githubFirmwareUrl"))
-    {
-        settings.githubFirmwareUrl = server.arg("githubFirmwareUrl");
+        settings.googleLoggingEnabled = server.hasArg("googleLoggingEnabled");
     }
     if (server.hasArg("unlockMs"))
     {
-        settings.unlockMs = server.arg("unlockMs").toInt();
+        long requestedUnlockMs = server.arg("unlockMs").toInt();
+        if (requestedUnlockMs < 500)
+        {
+            requestedUnlockMs = 500;
+        }
+        if (requestedUnlockMs > 30000)
+        {
+            requestedUnlockMs = 30000;
+        }
+        settings.unlockMs = requestedUnlockMs;
     }
-    settings.googleLoggingEnabled = server.hasArg("googleLoggingEnabled");
     saveSettings();
     server.sendHeader("Location", "/");
     server.send(302, "text/plain", "Saved");
@@ -648,6 +958,23 @@ void handleRemoveTag()
 
 void handleUnlock()
 {
+    unsigned long now = millis();
+    unsigned long retryAfterMs = 0;
+    if (relayOpen)
+    {
+        retryAfterMs = settings.unlockMs - (now - relayActivatedAt);
+    }
+    else if (hasUnlockedSinceBoot && now - relayActivatedAt < settings.unlockMs + 1000UL)
+    {
+        retryAfterMs = settings.unlockMs + 1000UL - (now - relayActivatedAt);
+    }
+
+    if (retryAfterMs > 0)
+    {
+        server.send(429, "application/json", "{\"ok\":false,\"error\":\"unlock_cooldown\",\"retryAfterMs\":" + String(retryAfterMs) + "}");
+        return;
+    }
+
     unlockDoor();
     server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -661,17 +988,7 @@ void handleRestart()
 
 void handleOta()
 {
-    String url = server.hasArg("url") ? server.arg("url") : settings.githubFirmwareUrl;
-    url.trim();
-    if (url.length() == 0)
-    {
-        server.send(400, "text/plain", "Missing URL");
-        return;
-    }
-
-    settings.githubFirmwareUrl = url;
-    saveSettings();
-
+    String url = REPO_OTA_URL;
     bool success = installFirmwareFromUrl(url);
     if (success)
     {
@@ -721,6 +1038,23 @@ void handleRfidRead()
     }
 
     String uid = uidToString(mfrc522.uid.uidByte, mfrc522.uid.size);
+    unsigned long now = millis();
+    unsigned long repeatGuardMs = settings.unlockMs + 1000UL;
+    if (repeatGuardMs < RFID_REPEAT_GUARD_MS)
+    {
+        repeatGuardMs = RFID_REPEAT_GUARD_MS;
+    }
+
+    if (uid.equalsIgnoreCase(lastProcessedRfidUid) && now - lastProcessedRfidAt < repeatGuardMs)
+    {
+        lastProcessedRfidAt = now;
+        mfrc522.PICC_HaltA();
+        mfrc522.PCD_StopCrypto1();
+        return;
+    }
+
+    lastProcessedRfidUid = uid;
+    lastProcessedRfidAt = now;
     lastUid = uid;
     bool allowed = isAuthorized(uid);
 
@@ -772,6 +1106,7 @@ void setup()
 
     server.on("/", HTTP_GET, handleRoot);
     server.on("/api/status", HTTP_GET, handleStatus);
+    server.on("/api/update-check", HTTP_GET, handleUpdateCheck);
     server.on("/api/wifi-scan", HTTP_GET, []() {
         server.send(200, "application/json", buildWifiScanJson());
     });
@@ -815,6 +1150,7 @@ void setup()
 
 void loop()
 {
+    updateRelay();
     server.handleClient();
     handleRfidRead();
 
