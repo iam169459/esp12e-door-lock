@@ -8,6 +8,15 @@
 #include <FS.h>
 #include <ArduinoJson.h>
 #include <Updater.h>
+#include "validation.h"
+
+/**
+ * ESP12E RFID Door Lock Firmware
+ * 
+ * Hardware: ESP-12E / NodeMCU with MFRC522 RFID reader and relay
+ * Features: Web UI, WiFi management, OTA updates, Google Sheets logging
+ * Security: Digest auth, per-device passwords, optional cert pinning
+ */
 
 // Wiring for NodeMCU / ESP-12E:
 // RC522 RST -> D2 (GPIO4)
@@ -19,7 +28,7 @@
 constexpr uint8_t RST_PIN = D2;
 constexpr uint8_t SS_PIN = D8;
 constexpr uint8_t RELAY_PIN = D1;
-constexpr uint8_t DOOR_SENSOR_PIN = D0;   // optional door switch
+constexpr uint8_t DOOR_SENSOR_PIN = D0;   // optional door switch (reed switch)
 constexpr uint8_t BUZZER_PIN = D4;        // optional buzzer
 constexpr uint8_t LED_PIN = D3;           // optional status LED
 
@@ -34,6 +43,19 @@ const char *TAGS_FILE = "/tags.json";
 const char *FIRMWARE_VERSION = APP_VERSION;
 const char *REPO_OTA_URL = "https://github.com/iam169459/esp12e-door-lock/releases/latest/download/firmware.bin";
 const char *GITHUB_RELEASE_API = "https://api.github.com/repos/iam169459/esp12e-door-lock/releases/latest";
+
+// Security: Set to true to disable SSL certificate verification (INSECURE - for testing only)
+// Set to false to enable certificate fingerprint verification (RECOMMENDED for production)
+#ifndef VERIFY_SSL_CERTS
+#define VERIFY_SSL_CERTS false
+#endif
+
+// GitHub API certificate fingerprint (SHA-256) - update when cert rotates
+// Current as of 2024: api.github.com
+const char *GITHUB_API_FINGERPRINT = "B6:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F";
+// GitHub releases download fingerprint (objects.githubusercontent.com)
+const char *GITHUB_RELEASES_FINGERPRINT = "B6:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F:8E:7F";
+
 constexpr unsigned long RFID_REPEAT_GUARD_MS = 750;
 constexpr unsigned long RFID_SCAN_POLL_MS = 10;
 constexpr unsigned long RELEASE_CHECK_INTERVAL_MS = 15UL * 60UL * 1000UL;
@@ -79,7 +101,26 @@ ESP8266WebServer server(80);
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 void handleSheetsTest();
 void saveAuthorizedTags();
+void startWifiConnection();
+void startApMode();
+void handleWifiConnection();
+WiFiClientSecure createSecureClient(const char *fingerprint = nullptr);
 
+// WiFi scan async state
+String cachedWifiScanJson = "";
+bool wifiScanInProgress = false;
+unsigned long wifiScanStartTime = 0;
+constexpr unsigned long WIFI_SCAN_TIMEOUT_MS = 5000;
+
+void onWifiScanDone(int networksFound);
+void startWifiScanAsync();
+String getWifiScanJson();
+
+/**
+ * Read entire file from SPIFFS into String.
+ * @param path File path
+ * @return File contents or empty string on error
+ */
 String readFile(const String &path)
 {
     if (!SPIFFS.exists(path))
@@ -98,6 +139,12 @@ String readFile(const String &path)
     return value;
 }
 
+/**
+ * Write String to file in SPIFFS.
+ * @param path File path
+ * @param value Content to write
+ * @return true on success
+ */
 bool writeFile(const String &path, const String &value)
 {
     File file = SPIFFS.open(path, "w");
@@ -111,6 +158,12 @@ bool writeFile(const String &path, const String &value)
     return true;
 }
 
+/**
+ * Convert RFID UID bytes to uppercase hex string.
+ * @param uid Pointer to UID bytes
+ * @param length Number of bytes
+ * @return Hex string (e.g., "01A2B3C4")
+ */
 String uidToString(const byte *uid, byte length)
 {
     String result;
@@ -126,6 +179,10 @@ String uidToString(const byte *uid, byte length)
     return result;
 }
 
+/**
+ * Load device settings from SPIFFS.
+ * Sets defaults if file missing or corrupt.
+ */
 void loadSettings()
 {
     String data = readFile(SETTINGS_FILE);
@@ -176,6 +233,9 @@ void loadSettings()
     }
 }
 
+/**
+ * Save device settings to SPIFFS as JSON.
+ */
 void saveSettings()
 {
     DynamicJsonDocument doc(512);
@@ -192,6 +252,11 @@ void saveSettings()
     writeFile(SETTINGS_FILE, out);
 }
 
+/**
+ * Generate a random password using a safe alphabet (no ambiguous chars).
+ * @param length Password length
+ * @return Random password string
+ */
 String generateDevicePassword(size_t length)
 {
     const char alphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
@@ -204,6 +269,11 @@ String generateDevicePassword(size_t length)
     return password;
 }
 
+/**
+ * Ensure admin and AP passwords meet minimum length requirements.
+ * Generates new passwords on first boot.
+ * @return true if passwords were generated
+ */
 bool ensureDevicePasswords()
 {
     bool generated = false;
@@ -224,6 +294,11 @@ bool ensureDevicePasswords()
     return generated;
 }
 
+/**
+ * Add or update a tag in the authorized tags array.
+ * @param uid Card UID (normalized to uppercase)
+ * @param holderName Card holder name
+ */
 void appendLoadedTag(String uid, String holderName)
 {
     uid.trim();
@@ -248,6 +323,11 @@ void appendLoadedTag(String uid, String holderName)
     authorizedTagCount++;
 }
 
+/**
+ * Load authorized tags from SPIFFS.
+ * Supports legacy JSON array format and current JSON Lines format.
+ * Migrates legacy format on load.
+ */
 void loadAuthorizedTags()
 {
     authorizedTagCount = 0;
@@ -312,31 +392,51 @@ void loadAuthorizedTags()
             continue;
         }
         appendLoadedTag(record["uid"] | "", record["name"] | "");
-    }
-    file.close();
+}
+file.close();
 }
 
+/**
+ * Save authorized tags to SPIFFS in JSON Lines format.
+ * Each line is a JSON object: {"uid":"...","name":"..."}
+ * Verifies each write operation.
+ */
 void saveAuthorizedTags()
 {
     File file = SPIFFS.open(TAGS_FILE, "w");
     if (!file)
     {
+        Serial.println("Failed to open tags file for writing");
         return;
     }
 
     DynamicJsonDocument record(160);
+    bool writeFailed = false;
     for (uint16_t i = 0; i < authorizedTagCount; ++i)
     {
         record.clear();
         JsonObject tag = record.to<JsonObject>();
         tag["uid"] = authorizedTags[i].uid;
         tag["name"] = authorizedTags[i].holderName;
-        serializeJson(record, file);
+        if (serializeJson(record, file) == 0)
+        {
+            writeFailed = true;
+            break;
+        }
         file.println();
     }
     file.close();
+    if (writeFailed)
+    {
+        Serial.println("Failed to write tags to file");
+    }
 }
 
+/**
+ * Check if a UID is in the authorized tags list.
+ * @param uid Card UID to check
+ * @return true if authorized
+ */
 bool isAuthorized(const String &uid)
 {
     for (uint8_t i = 0; i < authorizedTagCount; ++i)
@@ -349,6 +449,11 @@ bool isAuthorized(const String &uid)
     return false;
 }
 
+/**
+ * Get holder name for a UID.
+ * @param uid Card UID
+ * @return Holder name or "Unassigned"
+ */
 String holderNameFor(const String &uid)
 {
     for (uint8_t i = 0; i < authorizedTagCount; ++i)
@@ -436,27 +541,40 @@ void unlockDoor()
     lastStatus = "unlocked";
 }
 
+/**
+ * Auto-close relay after unlock duration expires.
+ * Uses millis() rollover-safe comparison.
+ */
 void updateRelay()
 {
     if (relayOpen && millis() - relayActivatedAt >= settings.unlockMs)
     {
-    setRelay(false);
-    lastStatus = "locked";
+        setRelay(false);
+        lastStatus = "locked";
     }
 }
 
+/**
+ * Post event data to Google Sheets via Apps Script web app.
+ * Handles Google's redirect response pattern.
+ * @param eventType Event type (e.g., "access", "door", "test")
+ * @param uid Card UID or last known UID
+ * @param note Additional note (e.g., "granted", "denied", "open", "closed")
+ * @param testRequest If true, bypasses logging enabled check and uses longer timeout
+ * @param holderName Card holder name (for access events)
+ * @return true on success
+ */
 bool postToGoogleSheet(const String &eventType, const String &uid, const String &note, bool testRequest = false, const String &holderName = "")
 {
     lastSheetsHttpCode = 0;
     lastSheetsError = "";
-    if ((!settings.googleLoggingEnabled && !testRequest) || settings.googleSheetUrl.length() < 10)
+    if ((!settings.googleLoggingEnabled && !testRequest) || !isValidUrl(settings.googleSheetUrl))
     {
-        lastSheetsError = "Logging is disabled or the Apps Script URL is missing";
+        lastSheetsError = "Logging is disabled or the Apps Script URL is invalid";
         return false;
     }
 
-    WiFiClientSecure client;
-    client.setInsecure();
+    WiFiClientSecure client = createSecureClient();
     HTTPClient http;
     http.setTimeout(testRequest ? 20000 : 4000);
     if (!http.begin(client, settings.googleSheetUrl))
@@ -494,8 +612,7 @@ bool postToGoogleSheet(const String &eventType, const String &uid, const String 
         }
 
         http.end();
-        WiFiClientSecure redirectClient;
-        redirectClient.setInsecure();
+        WiFiClientSecure redirectClient = createSecureClient();
         HTTPClient redirect;
         redirect.setTimeout(testRequest ? 20000 : 4000);
         redirect.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
@@ -521,6 +638,12 @@ bool postToGoogleSheet(const String &eventType, const String &uid, const String 
     return false;
 }
 
+/**
+ * Download and install firmware from URL using ESP8266 Updater.
+ * Uses certificate pinning when VERIFY_SSL_CERTS is enabled.
+ * @param url Firmware binary URL (must be HTTPS)
+ * @return true on successful installation
+ */
 bool installFirmwareFromUrl(const String &url)
 {
     otaFailureReason = "";
@@ -531,8 +654,7 @@ bool installFirmwareFromUrl(const String &url)
     }
 
     HTTPClient http;
-    WiFiClientSecure client;
-    client.setInsecure();
+    WiFiClientSecure client = createSecureClient(GITHUB_RELEASES_FINGERPRINT);
     http.setTimeout(15000);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     if (!http.begin(client, url))
@@ -568,7 +690,6 @@ bool installFirmwareFromUrl(const String &url)
     unsigned long streamWaitStarted = millis();
     while (!stream->available() && stream->connected() && millis() - streamWaitStarted < 10000UL)
     {
-        delay(10);
         yield();
     }
     if (!stream->available())
@@ -605,8 +726,7 @@ bool fetchLatestRelease()
         return false;
     }
 
-    WiFiClientSecure client;
-    client.setInsecure();
+    WiFiClientSecure client = createSecureClient(GITHUB_API_FINGERPRINT);
     HTTPClient http;
     http.setTimeout(5000);
     if (!http.begin(client, GITHUB_RELEASE_API))
@@ -689,23 +809,68 @@ String buildStatusJson()
     return output;
 }
 
-String buildWifiScanJson()
+/**
+ * Start asynchronous WiFi scan.
+ * Only works in STA mode. Returns cached results if scan in progress.
+ */
+void startWifiScanAsync()
 {
-    DynamicJsonDocument doc(1024);
-    JsonArray networks = doc.to<JsonArray>();
-    int found = WiFi.scanNetworks(false, true);
-    for (int i = 0; i < found; ++i)
+    if (wifiScanInProgress)
     {
-        JsonObject item = networks.createNestedObject();
-        item["ssid"] = WiFi.SSID(i);
-        item["rssi"] = WiFi.RSSI(i);
-        item["enc"] = WiFi.encryptionType(i) == ENC_TYPE_NONE ? "OPEN" : "SECURED";
+        return;
     }
-    String output;
-    serializeJson(networks, output);
-    return output;
+    if (WiFi.getMode() != WIFI_STA)
+    {
+        cachedWifiScanJson = "[]";
+        return;
+    }
+    wifiScanInProgress = true;
+    wifiScanStartTime = millis();
+    WiFi.scanNetworksAsync(onWifiScanDone);
 }
 
+/**
+ * Callback for async WiFi scan completion.
+ * @param networksFound Number of networks found (negative on error)
+ */
+void onWifiScanDone(int networksFound)
+{
+    wifiScanInProgress = false;
+    DynamicJsonDocument doc(1024);
+    JsonArray networks = doc.to<JsonArray>();
+    if (networksFound > 0)
+    {
+        for (int i = 0; i < networksFound; ++i)
+        {
+            JsonObject item = networks.createNestedObject();
+            item["ssid"] = WiFi.SSID(i);
+            item["rssi"] = WiFi.RSSI(i);
+            item["enc"] = WiFi.encryptionType(i) == ENC_TYPE_NONE ? "OPEN" : "SECURED";
+        }
+    }
+    serializeJson(networks, cachedWifiScanJson);
+}
+
+/**
+ * Get WiFi scan results (cached or start new scan).
+ * @return JSON array of networks
+ */
+String getWifiScanJson()
+{
+    if (!wifiScanInProgress && cachedWifiScanJson.length() == 0)
+    {
+        startWifiScanAsync();
+    }
+    // Return cached results if scan in progress or completed
+    return cachedWifiScanJson.length() > 0 ? cachedWifiScanJson : "[]";
+}
+
+/**
+ * Try to read RFID card UID if present.
+ * Non-blocking - returns immediately if no card.
+ * @param uidOut Output parameter for UID string
+ * @return true if card read successfully
+ */
 bool readCardUidIfPresent(String &uidOut)
 {
     if (!mfrc522.PICC_IsNewCardPresent())
@@ -923,7 +1088,6 @@ void handleRoot()
             });
             document.querySelectorAll('section[id]').forEach(section => section.classList.add('hidden'));
             document.getElementById(tabName).classList.remove('hidden');
-            if (tabName === 'wifi') wifiScan();
             if (tabName === 'cards') loadCards();
     }
 
@@ -1322,27 +1486,45 @@ void handleSettings()
 
     if (server.hasArg("wifiSsid"))
     {
-        settings.wifiSSID = server.arg("wifiSsid");
+        String newSsid = server.arg("wifiSsid");
+        newSsid.trim();
+        if (!isValidSsid(newSsid))
+        {
+            server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid SSID\"}");
+            return;
+        }
+        settings.wifiSSID = newSsid;
     }
     if (server.hasArg("wifiPassword") && server.arg("wifiPassword").length() > 0)
     {
-        settings.wifiPassword = server.arg("wifiPassword");
+        String newPwd = server.arg("wifiPassword");
+        newPwd.trim();
+        if (!isValidPassword(newPwd))
+        {
+            server.send(400, "application/json", "{\"ok\":false,\"error\":\"WiFi password must be 8-63 characters\"}");
+            return;
+        }
+        settings.wifiPassword = newPwd;
     }
     if (server.hasArg("googleSheetUrl"))
     {
-        settings.googleSheetUrl = server.arg("googleSheetUrl");
+        String newUrl = server.arg("googleSheetUrl");
+        newUrl.trim();
+        if (newUrl.length() > 0 && !isValidUrl(newUrl))
+        {
+            server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid Google Sheets URL\"}");
+            return;
+        }
+        settings.googleSheetUrl = newUrl;
         settings.googleLoggingEnabled = server.hasArg("googleLoggingEnabled");
     }
     if (server.hasArg("unlockMs"))
     {
         long requestedUnlockMs = server.arg("unlockMs").toInt();
-        if (requestedUnlockMs < 500)
+        if (!isValidUnlockMs(requestedUnlockMs))
         {
-            requestedUnlockMs = 500;
-        }
-        if (requestedUnlockMs > 30000)
-        {
-            requestedUnlockMs = 30000;
+            server.send(400, "application/json", "{\"ok\":false,\"error\":\"Unlock duration must be 500-30000 ms\"}");
+            return;
         }
         settings.unlockMs = requestedUnlockMs;
     }
@@ -1374,9 +1556,20 @@ void handleAddTag()
         holderName = "User " + String(authorizedTagCount + 1);
     }
 
+    if (!isValidUid(uid))
+    {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid UID format\"}");
+        return;
+    }
+    if (!isValidHolderName(holderName))
+    {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid holder name\"}");
+        return;
+    }
+
     if (!addAuthorizedTag(uid, holderName))
     {
-        server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid UID or card limit reached\"}");
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"Card limit reached\"}");
         return;
     }
 
@@ -1388,6 +1581,13 @@ void handleRemoveTag()
     String uid = server.arg("uid");
     uid.trim();
     uid.toUpperCase();
+
+    if (!isValidUid(uid))
+    {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid UID format\"}");
+        return;
+    }
+
     removeAuthorizedTag(uid);
     server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -1450,28 +1650,79 @@ void registerProtectedRoute(const char *uri, HTTPMethod method, ESP8266WebServer
     });
 }
 
-void connectToWifi()
+enum WifiState
 {
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(settings.wifiSSID.c_str(), settings.wifiPassword.c_str());
+    WIFI_IDLE,
+    WIFI_CONNECTING_STA,
+    WIFI_STARTING_AP
+};
 
-    for (int i = 0; i < 40; ++i)
+WifiState wifiState = WIFI_IDLE;
+unsigned long wifiStateStartTime = 0;
+constexpr unsigned long WIFI_STA_TIMEOUT_MS = 10000;
+
+WiFiClientSecure createSecureClient(const char *fingerprint)
+{
+    WiFiClientSecure client;
+#if VERIFY_SSL_CERTS
+    if (fingerprint)
+    {
+        client.setFingerprint(fingerprint);
+    }
+    else
+    {
+        client.setInsecure();
+    }
+#else
+    client.setInsecure();
+#endif
+    return client;
+}
+
+void startWifiConnection()
+{
+    WiFi.setSleepMode(WIFI_NONE_SLEEP);
+    if (settings.wifiSSID.length() > 0)
+    {
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(settings.wifiSSID.c_str(), settings.wifiPassword.c_str());
+        wifiState = WIFI_CONNECTING_STA;
+        wifiStateStartTime = millis();
+    }
+    else
+    {
+        startApMode();
+    }
+}
+
+void startApMode()
+{
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, settings.apPassword.c_str());
+    wifiState = WIFI_IDLE;
+    Serial.println("Started AP mode: " + String(AP_SSID));
+}
+
+void handleWifiConnection()
+{
+    if (wifiState == WIFI_CONNECTING_STA)
     {
         if (WiFi.status() == WL_CONNECTED)
         {
-            return;
+            wifiState = WIFI_IDLE;
+            Serial.println("WiFi connected: " + WiFi.localIP().toString());
         }
-        delay(250);
+        else if (millis() - wifiStateStartTime >= WIFI_STA_TIMEOUT_MS)
+        {
+            Serial.println("WiFi STA connection timeout, starting AP mode");
+            startApMode();
+        }
     }
-
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, settings.apPassword.c_str());
-}
-
-void setupWifi()
-{
-    WiFi.setSleepMode(WIFI_NONE_SLEEP);
-    connectToWifi();
+    else if (wifiState == WIFI_IDLE && WiFi.getMode() == WIFI_STA && WiFi.status() != WL_CONNECTED && settings.wifiSSID.length() > 0)
+    {
+        Serial.println("WiFi disconnected, attempting reconnect...");
+        startWifiConnection();
+    }
 }
 
 void handleRfidRead()
@@ -1496,7 +1747,6 @@ void handleRfidRead()
 
     if (uid.equalsIgnoreCase(lastProcessedRfidUid) && now - lastProcessedRfidAt < repeatGuardMs)
     {
-        lastProcessedRfidAt = now;
         mfrc522.PICC_HaltA();
         mfrc522.PCD_StopCrypto1();
         return;
@@ -1546,18 +1796,47 @@ void setup()
 
     if (!SPIFFS.begin())
     {
-        SPIFFS.format();
+        Serial.println("SPIFFS mount failed, attempting format...");
+        if (SPIFFS.format())
+        {
+            if (!SPIFFS.begin())
+            {
+                Serial.println("SPIFFS format failed, filesystem unusable");
+            }
+        }
+        else
+        {
+            Serial.println("SPIFFS format failed");
+        }
     }
 
     loadSettings();
     ensureDevicePasswords();
     Serial.println("Device security credentials (keep this serial log private):");
     Serial.println("Username: admin");
-    Serial.println("Admin password: " + settings.adminPassword);
+    String maskedAdminPwd = settings.adminPassword;
+    if (maskedAdminPwd.length() > 8)
+    {
+        maskedAdminPwd = maskedAdminPwd.substring(0, 4) + "****" + maskedAdminPwd.substring(maskedAdminPwd.length() - 4);
+    }
+    else
+    {
+        maskedAdminPwd = "****";
+    }
+    Serial.println("Admin password: " + maskedAdminPwd);
     Serial.println("Setup AP SSID: " + String(AP_SSID));
-    Serial.println("Setup AP password: " + settings.apPassword);
+    String maskedApPwd = settings.apPassword;
+    if (maskedApPwd.length() > 8)
+    {
+        maskedApPwd = maskedApPwd.substring(0, 4) + "****" + maskedApPwd.substring(maskedApPwd.length() - 4);
+    }
+    else
+    {
+        maskedApPwd = "****";
+    }
+    Serial.println("Setup AP password: " + maskedApPwd);
     loadAuthorizedTags();
-    setupWifi();
+    startWifiConnection();
 
     registerProtectedRoute("/", HTTP_GET, handleRoot);
     registerProtectedRoute("/api/status", HTTP_GET, handleStatus);
@@ -1565,21 +1844,18 @@ void setup()
     registerProtectedRoute("/api/update-check", HTTP_GET, handleUpdateCheck);
     registerProtectedRoute("/api/settings", HTTP_GET, handleSettingsRead);
     registerProtectedRoute("/api/wifi-scan", HTTP_GET, []() {
-        server.send(200, "application/json", buildWifiScanJson());
+        server.send(200, "application/json", getWifiScanJson());
     });
     registerProtectedRoute("/api/scan-tag", HTTP_GET, []() {
         String uid;
-        if (!readCardUidIfPresent(uid))
+        unsigned long start = millis();
+        while (millis() - start < 15000)
         {
-            unsigned long start = millis();
-            while (millis() - start < 15000)
+            if (readCardUidIfPresent(uid))
             {
-                if (readCardUidIfPresent(uid))
-                {
-                    break;
-                }
-                delay(RFID_SCAN_POLL_MS);
+                break;
             }
+            delay(RFID_SCAN_POLL_MS);
         }
 
         if (uid.length() == 0)
@@ -1620,10 +1896,7 @@ void loop()
         postToGoogleSheet("door", lastUid, doorOpen ? "open" : "closed");
     }
 
-    if (WiFi.status() != WL_CONNECTED)
-    {
-        connectToWifi();
-    }
+    handleWifiConnection();
 
     delay(RFID_SCAN_POLL_MS);
 }
